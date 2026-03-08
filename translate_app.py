@@ -117,7 +117,7 @@ if start_button:
         count += 1
         progress = int((count / total_to_translate) * 100)
         progress_bar.progress(progress)
-        status.write(f"Translated chapter {i + 1} ({count}/{total_to_translate})")
+        st.write(f"Translated chapter {i + 1} ({count}/{total_to_translate})")
 
     # write out translated epub
     with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as out_tf:
@@ -125,7 +125,7 @@ if start_button:
 
     epub.write_epub(output_temp_path, book)
     progress_bar.progress(100)
-    status.success(f"Translation finished: {count} chapter(s) translated.")
+    st.success(f"Translation finished: {count} chapter(s) translated.")
 
     # prepare download
     # default filename: {originalName}_de.epub
