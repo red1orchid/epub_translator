@@ -7,7 +7,7 @@ import ebooklib
 
 from chapter_translator import ChapterTranslator
 
-translator = ChapterTranslator(model="gpt-4.1", api_key=st.secrets['openai_key'])
+translator = ChapterTranslator(model=st.secrets['openai_model'], api_key=st.secrets['openai_key'])
 
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
