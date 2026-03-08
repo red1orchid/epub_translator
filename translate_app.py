@@ -3,6 +3,7 @@ import tempfile
 
 import streamlit as st
 from ebooklib import epub
+import ebooklib
 
 from chapter_translator import ChapterTranslator
 
@@ -30,13 +31,13 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tf:
 book = epub.read_epub(temp_input_path)
 
 # get chapter/document items
-chapters = list(book.get_items_of_type(epub.ITEM_DOCUMENT))
+chapters = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
 n_chapters = len(chapters)
 
 st.write(f"Found **{n_chapters}** chapter(s).")
 
 # choose range / all
-translate_all = st.checkbox("Translate all chapters", value=True)
+translate_all = st.checkbox("Translate all chapters", value=False)
 
 start_idx = 1
 end_idx = n_chapters
