@@ -87,8 +87,7 @@ if start_button:
         try:
             result = translator.translate(chapter)
         except Exception as exc:
-            # don't stop the whole process; record and continue
-            status.error(f"Error translating chapter {i + 1}: {exc}")
+            st.error(f"Error translating chapter {i + 1}: {exc}")
             result = None
 
         # If a result is returned, try to set the chapter content

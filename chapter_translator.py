@@ -63,9 +63,8 @@ class ChapterTranslator:
         try:
             lists = re.findall(r'\[.*?\]', response, re.DOTALL)
             return json.loads(lists[0])
-        except:
-            print(f"Failed to parse a response: {response}")
-            return batch
+        except Exception as e:
+            raise Exception(f"Failed to parse response: {e}\nRaw response: {response}") from e
 
     def _make_batches(self, raw_sections) -> List[List[str]]:
         batches = []
