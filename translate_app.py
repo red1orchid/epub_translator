@@ -105,9 +105,7 @@ start_button = st.button("Start translation")
 # Keep a place for logs/progress
 progress_bar = st.progress(0)
 status = st.empty()
-
-# Glossary display area
-glossary_container = st.empty()
+chapter_status = st.empty()
 
 # We'll store translated book in a temporary file and then offer download
 output_temp_path = None
@@ -146,12 +144,12 @@ if start_button:
             # Update glossary for cross-chapter consistency
             translator.update_glossary(raw_sections, translated_texts)
 
-            # Display current glossary
+            # Display current glossary in collapsible expander
             if translator.glossary:
-                with glossary_container.container():
-                    st.subheader("Glossary")
-                    for term, translation in translator.glossary.items():
-                        st.write(f"**{term}** → {translation}")
+                with glossary_container:
+                    with st.expander(f"Glossary ({len(translator.glossary)} terms)"):
+                        for term, translation in translator.glossary.items():
+                            st.write(f"**{term}** → {translation}")
 
         except Exception as exc:
             st.error(f"Error translating chapter {i + 1}: {exc}")
@@ -159,7 +157,7 @@ if start_button:
         count += 1
         progress = int((count / total_to_translate) * 100)
         progress_bar.progress(progress)
-        st.write(f"Translated chapter {i + 1} ({count}/{total_to_translate})")
+        chapter_status.info(f"**Translated chapter {i + 1} of {e + 1}** ({count}/{total_to_translate})")
 
     # write out translated epub, preserving original navigation structure
     with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as out_tf:
