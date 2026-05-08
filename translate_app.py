@@ -4,15 +4,35 @@ import tempfile
 import streamlit as st
 from ebooklib import epub
 import ebooklib
+from bs4 import BeautifulSoup
 
 from chapter_translator import ChapterTranslator
-
-translator = ChapterTranslator(model=st.secrets['openai_model'], api_key=st.secrets['openai_key'])
+from llm_provider import create_provider
 
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 st.title("EPUB Chapter Translator")
 
+# --- Provider / model selection ---
+provider_name = st.selectbox("LLM Provider", ["openai", "anthropic"])
+
+if provider_name == "openai":
+    api_key = st.secrets.get("openai_key", "")
+    default_model = st.secrets.get("openai_model", "gpt-4o")
+elif provider_name == "anthropic":
+    api_key = st.secrets.get("anthropic_key", "")
+    default_model = st.secrets.get("anthropic_model", "claude-sonnet-4-20250514")
+
+model = st.text_input("Model", value=default_model)
+
+if not api_key:
+    st.error(f"No API key found for {provider_name}. Add it to .streamlit/secrets.toml")
+    st.stop()
+
+provider = create_provider(provider_name, api_key=api_key, model=model)
+translator = ChapterTranslator(provider=provider)
+
+# --- File upload ---
 uploaded = st.file_uploader("Choose an EPUB file", type=["epub"])
 
 if uploaded is None:
@@ -30,11 +50,33 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tf:
 # load book
 book = epub.read_epub(temp_input_path)
 
-# get chapter/document items
-chapters = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+# get chapter/document items, excluding navigation documents
+all_items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+nav_item_names = set()
+
+# Identify navigation items to skip
+for item in all_items:
+    if getattr(item, 'is_chapter', lambda: False)():
+        continue
+    # Check if item is a nav document by content
+    try:
+        content = item.get_content().decode("utf-8", errors="ignore")
+        soup = BeautifulSoup(content, "html.parser")
+        if soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", id="toc"):
+            nav_item_names.add(item.get_name())
+    except Exception:
+        pass
+
+# Also check by file name patterns common for nav/toc
+for item in all_items:
+    name = item.get_name().lower()
+    if "nav" in name or "toc" in name:
+        nav_item_names.add(item.get_name())
+
+chapters = [item for item in all_items if item.get_name() not in nav_item_names]
 n_chapters = len(chapters)
 
-st.write(f"Found **{n_chapters}** chapter(s).")
+st.write(f"Found **{n_chapters}** translatable chapter(s) (skipping {len(nav_item_names)} navigation item(s)).")
 
 # choose range / all
 translate_all = st.checkbox("Translate all chapters", value=False)
@@ -64,6 +106,9 @@ start_button = st.button("Start translation")
 progress_bar = st.progress(0)
 status = st.empty()
 
+# Glossary display area
+glossary_container = st.empty()
+
 # We'll store translated book in a temporary file and then offer download
 output_temp_path = None
 
@@ -80,50 +125,47 @@ if start_button:
         if i < s or i > e:
             continue
 
-        # Call translator.translate(chapter)
-        # The translator may:
-        #  - return a str/bytes containing the new HTML/content
-        #  - modify the chapter object in place and return None
         try:
-            result = translator.translate(chapter)
+            # Get raw sections before translation for glossary update
+            soup = BeautifulSoup(chapter.content, "html.parser")
+            blocks = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
+            raw_sections = [tag.get_text(strip=True) for tag in blocks]
+
+            translator.translate(chapter)
+
+            # Extract translated sections for glossary update
+            soup_after = BeautifulSoup(chapter.content, "html.parser")
+            blocks_after = soup_after.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
+            # Every other block is the original (in brackets), so take even-indexed ones
+            translated_texts = []
+            for tag in blocks_after:
+                text = tag.get_text(strip=True)
+                if not text.startswith("[") or not text.endswith("]"):
+                    translated_texts.append(text)
+
+            # Update glossary for cross-chapter consistency
+            translator.update_glossary(raw_sections, translated_texts)
+
+            # Display current glossary
+            if translator.glossary:
+                with glossary_container.container():
+                    st.subheader("Glossary")
+                    for term, translation in translator.glossary.items():
+                        st.write(f"**{term}** → {translation}")
+
         except Exception as exc:
             st.error(f"Error translating chapter {i + 1}: {exc}")
-            result = None
-
-        # If a result is returned, try to set the chapter content
-        if result is not None:
-            # ensure bytes
-            if isinstance(result, str):
-                new_bytes = result.encode("utf-8")
-            else:
-                new_bytes = result
-
-            # attempt to set content in a few possible ways
-            if hasattr(chapter, "set_content"):
-                try:
-                    chapter.set_content(new_bytes)
-                except Exception:
-                    setattr(chapter, "content", new_bytes)
-            elif hasattr(chapter, "content"):
-                try:
-                    chapter.content = new_bytes
-                except Exception:
-                    setattr(chapter, "content", new_bytes)
-            else:
-                setattr(chapter, "content", new_bytes)
-
-        # else assume translation mutated chapter in place
 
         count += 1
         progress = int((count / total_to_translate) * 100)
         progress_bar.progress(progress)
         st.write(f"Translated chapter {i + 1} ({count}/{total_to_translate})")
 
-    # write out translated epub
+    # write out translated epub, preserving original navigation structure
     with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as out_tf:
         output_temp_path = out_tf.name
 
-    epub.write_epub(output_temp_path, book)
+    epub.write_epub(output_temp_path, book, {"plugins": []})
     progress_bar.progress(100)
     st.success(f"Translation finished: {count} chapter(s) translated.")
 
