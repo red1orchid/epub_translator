@@ -17,6 +17,7 @@ class ChapterTranslator:
         self.glossary: dict = {}
 
     def translate(self, chapter: EpubHtml):
+        """Translate chapter in-place. Returns (raw_sections, translated_sections)."""
         soup = BeautifulSoup(chapter.content, "html.parser")
         formatted_sections = []
         raw_sections = []
@@ -28,6 +29,18 @@ class ChapterTranslator:
 
         translated_sections = self._translate_chapter(raw_sections)
 
+        self._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
+        chapter.content = str(soup).encode("utf-8")
+        return raw_sections, translated_sections
+
+    def apply_cached(self, chapter: EpubHtml, raw_sections: List[str], translated_sections: List[str]):
+        """Apply previously cached translations to a chapter without calling LLM."""
+        soup = BeautifulSoup(chapter.content, "html.parser")
+        formatted_sections = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
+        self._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
+        chapter.content = str(soup).encode("utf-8")
+
+    def _apply_to_soup(self, soup, formatted_sections, translated_sections, raw_sections):
         for tag, new_text, original_text in zip(formatted_sections, translated_sections, raw_sections):
             # For links only replace link name, preserve href
             if tag.name == "li" and tag.find("a"):
@@ -48,8 +61,6 @@ class ChapterTranslator:
                 original_tag = soup.new_tag(tag.name)
                 original_tag.append(NavigableString(f"[{original_text}]"))
                 tag.insert_after(original_tag)
-
-        chapter.content = str(soup).encode("utf-8")
 
     def _translate_chapter(self, raw_sections: List[str]) -> List[str]:
         """Translate entire chapter as flowing text, split back by delimiters."""
