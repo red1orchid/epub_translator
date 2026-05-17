@@ -54,13 +54,19 @@ class ChapterTranslator:
 
                 original_tag = soup.new_tag(tag.name)
                 original_tag.append(NavigableString(f"[{original_text}]"))
-                tag.insert_after(original_tag)
+                if tag.parent:
+                    tag.insert_after(original_tag)
+                else:
+                    tag.append(original_tag)
             else:
                 tag.string = new_text
 
                 original_tag = soup.new_tag(tag.name)
                 original_tag.append(NavigableString(f"[{original_text}]"))
-                tag.insert_after(original_tag)
+                if tag.parent:
+                    tag.insert_after(original_tag)
+                else:
+                    tag.append(original_tag)
 
     def _translate_chapter(self, raw_sections: List[str]) -> List[str]:
         """Translate entire chapter as flowing text, split back by delimiters."""
