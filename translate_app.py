@@ -140,25 +140,12 @@ st.write(f"Found **{n_chapters}** translatable chapter(s).")
 # --- Chapter multiselect with readable labels ---
 chapter_labels = [_get_chapter_label(i, ch) for i, ch in enumerate(chapters)]
 
-# Select all / deselect all button
-select_all = st.button("Select / deselect all", use_container_width=True)
-if select_all:
-    if len(st.session_state.get("selected_labels", [])) == len(chapter_labels):
-        st.session_state["selected_labels"] = []
-    else:
-        st.session_state["selected_labels"] = chapter_labels
-    st.rerun()
-
 selected_labels = st.multiselect(
     "Select chapters to translate",
     options=chapter_labels,
-    default=st.session_state.get("selected_labels", []),
-    key="chapter_multiselect",
+    default=[],
     help="Each entry shows the chapter number and its heading or first line.",
 )
-
-# Update session state to track selection
-st.session_state["selected_labels"] = selected_labels
 
 selected_indices = [chapter_labels.index(lbl) for lbl in selected_labels]
 selected_indices.sort()
