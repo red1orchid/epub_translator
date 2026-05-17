@@ -131,6 +131,7 @@ start_button = st.button("Start translation")
 progress_bar = st.progress(0)
 status = st.empty()
 chapter_status = st.empty()
+glossary_container = st.empty()
 
 # We'll store translated book in a temporary file and then offer download
 output_temp_path = None

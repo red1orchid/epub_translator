@@ -7,6 +7,8 @@ from ebooklib.epub import EpubHtml
 
 from llm_provider import LLMProvider
 
+SECTION_DELIMITER = "⟪§⟫"
+
 
 class ChapterTranslator:
     def __init__(self, provider: LLMProvider, max_tokens: int = 100000):
@@ -24,7 +26,7 @@ class ChapterTranslator:
             formatted_sections.append(tag)
             raw_sections.append(tag.get_text(strip=True))
 
-        translated_sections = self._translate_sections(raw_sections)
+        translated_sections = self._translate_chapter(raw_sections)
 
         for tag, new_text, original_text in zip(formatted_sections, translated_sections, raw_sections):
             # For links only replace link name, preserve href
@@ -34,28 +36,23 @@ class ChapterTranslator:
             elif tag.has_attr("id"):
                 # Preserve tags with id (navigation anchors) but still show translation
                 original_id = tag["id"]
-                # Set translated text but keep the id
                 tag.string = new_text
                 tag["id"] = original_id
 
-                # Add original after
                 original_tag = soup.new_tag(tag.name)
                 original_tag.append(NavigableString(f"[{original_text}]"))
                 tag.insert_after(original_tag)
             else:
-                # Update original tag with translated text
                 tag.string = new_text
 
-                # Create tag for original content
                 original_tag = soup.new_tag(tag.name)
                 original_tag.append(NavigableString(f"[{original_text}]"))
-
-                # Insert the duplicate after the translated one
                 tag.insert_after(original_tag)
 
         chapter.content = str(soup).encode("utf-8")
 
-    def _translate_sections(self, raw_sections: List[str]) -> List[str]:
+    def _translate_chapter(self, raw_sections: List[str]) -> List[str]:
+        """Translate entire chapter as flowing text, split back by delimiters."""
         if not raw_sections:
             return []
 
@@ -72,23 +69,22 @@ class ChapterTranslator:
 
         return translated_sections
 
-    def _translate_batch(self, batch: List[str]) -> List[str]:
-        json_batch = json.dumps(batch, indent=2, ensure_ascii=False)
-        response = self._call_llm(json_batch)
-        try:
-            # Find the JSON array in the response
-            # Use a greedy match to get the outermost brackets
-            match = re.search(r'\[.*\]', response, re.DOTALL)
-            if not match:
-                raise ValueError("No JSON array found in response")
-            result = json.loads(match.group(0))
-            if len(result) != len(batch):
-                raise ValueError(
-                    f"Array length mismatch: expected {len(batch)}, got {len(result)}"
-                )
-            return result
-        except Exception as e:
-            raise Exception(f"Failed to parse response: {e}\nRaw response: {response}") from e
+    def _translate_batch(self, sections: List[str]) -> List[str]:
+        """Send sections as flowing text separated by delimiters, parse back."""
+        chapter_text = f"\n{SECTION_DELIMITER}\n".join(sections)
+        response = self._call_llm(chapter_text, len(sections))
+
+        # Split response by delimiter
+        parts = re.split(r'\s*' + re.escape(SECTION_DELIMITER) + r'\s*', response.strip())
+
+        if len(parts) != len(sections):
+            raise Exception(
+                f"Section count mismatch after translation. "
+                f"Expected {len(sections)}, got {len(parts)}.\n"
+                f"Raw response:\n{response}"
+            )
+
+        return [p.strip() for p in parts]
 
     def _make_batches(self, raw_sections: List[str]) -> List[List[str]]:
         """Split sections into batches that fit within token limits."""
@@ -105,7 +101,7 @@ class ChapterTranslator:
 
         return batches
 
-    def _call_llm(self, json_batch: str) -> str:
+    def _call_llm(self, chapter_text: str, section_count: int) -> str:
         glossary_text = ""
         if self.glossary:
             glossary_lines = [f"  {k} → {v}" for k, v in self.glossary.items()]
@@ -115,22 +111,26 @@ class ChapterTranslator:
             )
 
         system_msg = (
-            "You are a professional book translator. You translate text into German. "
+            "You are a professional book translator. You translate text into German.\n"
             "Rules:\n"
             "- Keep the translation close to the original meaning.\n"
             "- Use standard modern German grammar and vocabulary (A2–B1 level).\n"
             "- Avoid poetic, archaic, or overly complex phrasing.\n"
             "- Keep names, places, and book-specific terms consistent.\n"
             "- Do not add explanations, notes, or extra text.\n"
-            "- Output ONLY a valid JSON array with the same number of elements "
-            "and in the same order as the input."
+            f"- The text has sections separated by the delimiter {SECTION_DELIMITER}\n"
+            f"- Translate the text naturally as a whole, keeping full context across sections.\n"
+            f"- Preserve EVERY {SECTION_DELIMITER} delimiter exactly as-is in your output.\n"
+            f"- The output must have exactly {section_count} sections "
+            f"(i.e. exactly {section_count - 1} delimiters).\n"
+            "- Output ONLY the translated text with delimiters. No other text."
             f"{glossary_text}"
         )
 
         user_msg = (
-            f"Translate this JSON array of text sections into German. "
-            f"Return ONLY the JSON array with {json_batch.count(chr(10))} translated elements.\n\n"
-            f"{json_batch}"
+            f"Translate the following chapter into German. "
+            f"Keep the {SECTION_DELIMITER} delimiters in place:\n\n"
+            f"{chapter_text}"
         )
 
         messages = [
@@ -142,11 +142,9 @@ class ChapterTranslator:
 
     def update_glossary(self, raw_sections: List[str], translated_sections: List[str]):
         """Ask the LLM to extract key terms from the translated chapter for future consistency."""
-        # Only do this if we have content
         if not raw_sections or not translated_sections:
             return
 
-        # Take a sample of sections (first 20) to extract terms
         sample_pairs = list(zip(raw_sections[:20], translated_sections[:20]))
         pairs_text = "\n".join(
             f"  Original: {orig}\n  German: {trans}"
