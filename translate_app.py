@@ -192,7 +192,7 @@ if preview_button:
     preview_chapter = chapters[first_idx]
 
     soup = BeautifulSoup(preview_chapter.get_content(), "html.parser")
-    blocks = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
+    blocks = soup.find_all(["p", "li", "blockquote"])
     raw_sections = [tag.get_text(strip=True) for tag in blocks if tag.get_text(strip=True)]
     preview_sections = raw_sections[:PREVIEW_SECTIONS]
 
