@@ -135,7 +135,7 @@ for item in all_items:
 chapters = [item for item in all_items if item.get_name() not in nav_item_names]
 n_chapters = len(chapters)
 
-st.write(f"Found **{n_chapters}** translatable chapter(s) (skipping {len(nav_item_names)} navigation item(s)).")
+st.write(f"Found **{n_chapters}** translatable chapter(s).")
 
 # --- Chapter multiselect with readable labels ---
 chapter_labels = [_get_chapter_label(i, ch) for i, ch in enumerate(chapters)]
@@ -216,11 +216,6 @@ if preview_button:
         st.error("No API keys configured. Add them to .streamlit/secrets.toml")
         st.stop()
 
-    # Show original text
-    with st.expander("Original text", expanded=True):
-        for sec in preview_sections:
-            st.markdown(f"- {sec}")
-
     # Translate with each provider and show side-by-side
     cols = st.columns(len(preview_providers))
     for col, (label, prov) in zip(cols, preview_providers.items()):
@@ -232,7 +227,6 @@ if preview_button:
                 for orig, trans in zip(preview_sections, translated):
                     st.markdown(f"**→** {trans}")
                     st.caption(orig)
-                    st.divider()
             except Exception as exc:
                 st.error(f"Error: {exc}")
 
