@@ -128,7 +128,7 @@ if not api_key:
     st.stop()
 
 provider = create_provider(provider_name, api_key=api_key, model=model)
-translator = ChapterTranslator(provider=provider, max_tokens=30000)
+translator = ChapterTranslator(provider=provider, max_tokens=4000)
 
 # --- All provider configs for preview mode ---
 ALL_PROVIDERS = {

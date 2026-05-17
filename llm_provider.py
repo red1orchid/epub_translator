@@ -1,6 +1,8 @@
 import abc
 from typing import List, Dict
 
+__all__ = ["LLMProvider", "OpenAIProvider", "AnthropicProvider", "create_provider"]
+
 
 class LLMProvider(abc.ABC):
     @abc.abstractmethod
@@ -19,6 +21,7 @@ class OpenAIProvider(LLMProvider):
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
+            max_tokens=16384,
         )
         return completion.choices[0].message.content
 
