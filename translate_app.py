@@ -16,7 +16,7 @@ from llm_provider import create_provider
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # --- Session state ---
 for _key, _default in [
@@ -55,6 +55,25 @@ def _save_cached(file_hash, chapter_idx, prov, mdl, raw, translated):
         json.dump({"raw": raw, "translated": translated}, f, ensure_ascii=False)
 
 
+def _raw_response_path(file_hash, chapter_idx, prov, mdl):
+    h = hashlib.sha256(f"{file_hash}:{chapter_idx}:{prov}:{mdl}".encode()).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"{h}_raw.txt")
+
+
+def _save_raw_responses(file_hash, chapter_idx, prov, mdl, responses):
+    p = _raw_response_path(file_hash, chapter_idx, prov, mdl)
+    with open(p, "w") as f:
+        f.write("\n===BATCH===\n".join(responses))
+
+
+def _load_raw_responses(file_hash, chapter_idx, prov, mdl):
+    p = _raw_response_path(file_hash, chapter_idx, prov, mdl)
+    if os.path.exists(p):
+        with open(p) as f:
+            return f.read()
+    return None
+
+
 def _auto_download(data: bytes, filename: str, mime: str):
     """Best-effort automatic download via JS."""
     if len(data) > 50 * 1024 * 1024:  # skip for files > 50 MB
@@ -88,8 +107,11 @@ def _build_raw_text(cache_entries):
     return "\n".join(lines)
 
 
-st.title("EPUB Chapter Translator")
-st.caption(f"v{APP_VERSION}")
+_col_title, _col_cache_btn = st.columns([20, 1])
+with _col_title:
+    st.title("EPUB Chapter Translator")
+    st.caption(f"v{APP_VERSION}")
+_cache_btn_slot = _col_cache_btn.empty()
 
 # --- Provider / model selection ---
 provider_name = st.selectbox("LLM Provider", ["openai", "anthropic"])
@@ -218,6 +240,40 @@ n_chapters = len(chapters)
 
 st.write(f"Found **{n_chapters}** translatable chapter(s).")
 
+# --- Fill cache download button in header ---
+_all_cache_text_parts = []
+for _i in range(n_chapters):
+    _cached = _load_cached(file_hash, _i, provider_name, model)
+    if _cached:
+        _r, _t = _cached
+        _all_cache_text_parts.append(f"=== Chapter {_i + 1} ===\n" + "\n".join(
+            f"{t}\n[{o}]\n" for o, t in zip(_r, _t)
+        ))
+    else:
+        _raw_resp = _load_raw_responses(file_hash, _i, provider_name, model)
+        if _raw_resp:
+            _all_cache_text_parts.append(f"=== Chapter {_i + 1} (raw LLM) ===\n{_raw_resp}\n")
+
+if _all_cache_text_parts:
+    _cache_btn_slot.download_button(
+        label="\U0001f4be",
+        data="\n".join(_all_cache_text_parts).encode("utf-8"),
+        file_name=f"{name_root}_cache.txt",
+        mime="text/plain",
+        help="Download cached translations",
+        key="cache_dl_header",
+    )
+else:
+    _cache_btn_slot.download_button(
+        label="\U0001f4be",
+        data="",
+        file_name="empty",
+        mime="text/plain",
+        help="No cached translations yet",
+        disabled=True,
+        key="cache_dl_header",
+    )
+
 # --- Chapter multiselect with readable labels ---
 chapter_labels = [_get_chapter_label(i, ch) for i, ch in enumerate(chapters)]
 
@@ -318,6 +374,14 @@ if start_button:
     status.info(f"Translating {total_to_translate} chapter(s) ...")
     for i in selected_indices:
         chapter = chapters[i]
+
+        # Save raw LLM response to disk THE INSTANT it arrives (before parsing)
+        _resp_acc = []
+        def _on_resp(resp, _idx=i, _acc=_resp_acc):
+            _acc.append(resp)
+            _save_raw_responses(file_hash, _idx, provider_name, model, _acc)
+        translator.on_response = _on_resp
+
         try:
             cached = _load_cached(file_hash, i, provider_name, model)
             if cached:
@@ -328,7 +392,7 @@ if start_button:
                 )
             else:
                 raw_sections, translated_sections = translator.translate(chapter)
-                # Cache immediately so the translation is never lost
+                # Cache parsed result
                 _save_cached(file_hash, i, provider_name, model, raw_sections, translated_sections)
 
                 chapter_status.info(
@@ -339,6 +403,9 @@ if start_button:
 
         except Exception as exc:
             st.error(f"Error translating chapter {i + 1}: {exc}")
+            # Save raw LLM responses even if parsing/application failed
+            if translator._raw_responses:
+                _save_raw_responses(file_hash, i, provider_name, model, translator._raw_responses)
 
         count += 1
         progress_bar.progress(int((count / total_to_translate) * 100))
@@ -390,9 +457,8 @@ if start_button:
     except Exception:
         pass
 
-# --- Persistent downloads (visible on reruns / after session recovery) ---
+# --- Persistent EPUB download (visible on reruns within same session) ---
 if not start_button and not preview_button:
-    # EPUB from session state (survives widget reruns within same session)
     if st.session_state.output_epub_bytes is not None:
         st.success("Previous translation available for download.")
         st.download_button(
@@ -401,20 +467,4 @@ if not start_button and not preview_button:
             file_name=st.session_state.output_filename or "translated.epub",
             mime="application/epub+zip",
             key="dl_epub_persist",
-        )
-
-    # Raw text from disk cache (survives full session loss)
-    _disk_cached = {}
-    for _i in range(n_chapters):
-        _c = _load_cached(file_hash, _i, provider_name, model)
-        if _c:
-            _disk_cached[_i] = _c
-    if _disk_cached:
-        _raw = _build_raw_text(_disk_cached)
-        st.download_button(
-            label=f"Download cached translations ({len(_disk_cached)} ch, TXT)",
-            data=_raw.encode("utf-8"),
-            file_name=f"{name_root}_translations.txt",
-            mime="text/plain",
-            key="dl_raw_persist",
         )

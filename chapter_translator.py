@@ -1,4 +1,3 @@
-import json
 import re
 from typing import List
 
@@ -11,13 +10,15 @@ SECTION_DELIMITER = "⟪§⟫"
 
 
 class ChapterTranslator:
-    def __init__(self, provider: LLMProvider, max_tokens: int = 100000):
+    def __init__(self, provider: LLMProvider, max_tokens: int = 100000, on_response=None):
         self.provider = provider
         self.max_tokens = max_tokens
-        self.glossary: dict = {}
+        self._raw_responses: List[str] = []
+        self.on_response = on_response
 
     def translate(self, chapter: EpubHtml):
         """Translate chapter in-place. Returns (raw_sections, translated_sections)."""
+        self._raw_responses = []
         soup = BeautifulSoup(chapter.content, "html.parser")
         formatted_sections = []
         raw_sections = []
@@ -119,14 +120,6 @@ class ChapterTranslator:
         return batches
 
     def _call_llm(self, chapter_text: str, section_count: int) -> str:
-        glossary_text = ""
-        if self.glossary:
-            glossary_lines = [f"  {k} → {v}" for k, v in self.glossary.items()]
-            glossary_text = (
-                "\n\nUse this glossary for consistency with previous chapters:\n"
-                + "\n".join(glossary_lines)
-            )
-
         system_msg = (
             "You are a professional book translator. You translate text into German.\n"
             "Rules:\n"
@@ -141,7 +134,6 @@ class ChapterTranslator:
             f"- The output must have exactly {section_count} sections "
             f"(i.e. exactly {section_count - 1} delimiters).\n"
             "- Output ONLY the translated text with delimiters. No other text."
-            f"{glossary_text}"
         )
 
         user_msg = (
@@ -155,35 +147,9 @@ class ChapterTranslator:
             {"role": "user", "content": user_msg},
         ]
 
-        return self.provider.chat(messages)
+        response = self.provider.chat(messages)
+        self._raw_responses.append(response)
+        if self.on_response:
+            self.on_response(response)
+        return response
 
-    def update_glossary(self, raw_sections: List[str], translated_sections: List[str]):
-        """Ask the LLM to extract key terms from the translated chapter for future consistency."""
-        if not raw_sections or not translated_sections:
-            return
-
-        sample_pairs = list(zip(raw_sections[:20], translated_sections[:20]))
-        pairs_text = "\n".join(
-            f"  Original: {orig}\n  German: {trans}"
-            for orig, trans in sample_pairs
-        )
-
-        messages = [
-            {"role": "system", "content": (
-                "You extract key proper nouns, character names, places, and recurring "
-                "terms from translated text. Output ONLY a JSON object mapping "
-                "original terms to their German translations. Include only important "
-                "recurring terms (names, places, titles, special terms). "
-                "Output 5-20 terms maximum. Output ONLY valid JSON, no other text."
-            )},
-            {"role": "user", "content": f"Extract key terms from these translation pairs:\n{pairs_text}"},
-        ]
-
-        try:
-            response = self.provider.chat(messages)
-            match = re.search(r'\{.*\}', response, re.DOTALL)
-            if match:
-                new_terms = json.loads(match.group(0))
-                self.glossary.update(new_terms)
-        except Exception:
-            pass  # glossary update is best-effort
