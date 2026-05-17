@@ -16,7 +16,7 @@ from llm_provider import create_provider
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # --- Session state ---
 for _key, _default in [
@@ -107,11 +107,9 @@ def _build_raw_text(cache_entries):
     return "\n".join(lines)
 
 
-_col_title, _col_cache_btn = st.columns([20, 1])
-with _col_title:
-    st.title("EPUB Chapter Translator")
-    st.caption(f"v{APP_VERSION}")
-_cache_btn_slot = _col_cache_btn.empty()
+st.title("EPUB Chapter Translator")
+st.caption(f"v{APP_VERSION}")
+_cache_btn_slot = st.empty()
 
 # --- Provider / model selection ---
 provider_name = st.selectbox("LLM Provider", ["openai", "anthropic"])
@@ -256,7 +254,7 @@ for _i in range(n_chapters):
 
 if _all_cache_text_parts:
     _cache_btn_slot.download_button(
-        label="\U0001f4be",
+        label="💾",
         data="\n".join(_all_cache_text_parts).encode("utf-8"),
         file_name=f"{name_root}_cache.txt",
         mime="text/plain",
@@ -265,7 +263,7 @@ if _all_cache_text_parts:
     )
 else:
     _cache_btn_slot.download_button(
-        label="\U0001f4be",
+        label="💾 Cache",
         data="",
         file_name="empty",
         mime="text/plain",
@@ -439,17 +437,6 @@ if start_button:
             file_name=default_out_name,
             mime="application/epub+zip",
             key="dl_epub_main",
-        )
-
-    # Always offer raw text download if any translations succeeded
-    if all_translations:
-        raw_text = _build_raw_text(all_translations)
-        st.download_button(
-            label="Download raw translations (TXT)",
-            data=raw_text.encode("utf-8"),
-            file_name=f"{name_root}_translations.txt",
-            mime="text/plain",
-            key="dl_raw_main",
         )
 
     try:
