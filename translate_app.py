@@ -16,7 +16,7 @@ from llm_provider import create_provider
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
 
 # --- Session state ---
 for _key, _default in [
