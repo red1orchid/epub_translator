@@ -33,11 +33,36 @@ provider = create_provider(provider_name, api_key=api_key, model=model)
 translator = ChapterTranslator(provider=provider)
 
 # --- File upload ---
-uploaded = st.file_uploader("Choose an EPUB file", type=["epub"])
+uploaded = st.file_uploader("Choose an EPUB file")
 
 if uploaded is None:
     st.info("Upload an EPUB to begin.")
     st.stop()
+
+# Validate that the uploaded file is actually an EPUB (EPUBs are ZIP files)
+import zipfile
+try:
+    # Check if it's a valid ZIP file
+    with zipfile.ZipFile(uploaded, 'r') as zip_ref:
+        # EPUB must contain mimetype file at the start
+        namelist = zip_ref.namelist()
+        if 'mimetype' not in namelist:
+            st.error("Invalid EPUB file: missing mimetype")
+            st.stop()
+        # Check mimetype content
+        mimetype_content = zip_ref.read('mimetype').decode('utf-8')
+        if mimetype_content != 'application/epub+zip':
+            st.error("Invalid EPUB file: incorrect mimetype")
+            st.stop()
+except zipfile.BadZipFile:
+    st.error("Invalid EPUB file: not a valid ZIP archive")
+    st.stop()
+except Exception as e:
+    st.error(f"Error validating EPUB file: {e}")
+    st.stop()
+
+# Reset file pointer after reading
+uploaded.seek(0)
 
 # read uploaded bytes and write to a temp file (ebooklib reads from path)
 orig_filename = uploaded.name
