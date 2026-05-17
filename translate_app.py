@@ -15,6 +15,9 @@ from llm_provider import create_provider
 
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
+# --- Version (update with each commit to verify deployment) ---
+APP_VERSION = "1.2.0"
+
 # --- Session state ---
 for _key, _default in [
     ("translation_cache", {}),
@@ -86,6 +89,7 @@ def _build_raw_text(cache_entries):
 
 
 st.title("EPUB Chapter Translator")
+st.caption(f"v{APP_VERSION}")
 
 # --- Provider / model selection ---
 provider_name = st.selectbox("LLM Provider", ["openai", "anthropic"])
@@ -250,7 +254,6 @@ with col_preview:
 progress_bar = st.progress(0)
 status = st.empty()
 chapter_status = st.empty()
-glossary_container = st.empty()
 
 # We'll store translated book in a temporary file and then offer download
 output_temp_path = None
@@ -327,13 +330,6 @@ if start_button:
                 raw_sections, translated_sections = translator.translate(chapter)
                 # Cache immediately so the translation is never lost
                 _save_cached(file_hash, i, provider_name, model, raw_sections, translated_sections)
-
-                translator.update_glossary(raw_sections, translated_sections)
-                if translator.glossary:
-                    with glossary_container:
-                        with st.expander(f"Glossary ({len(translator.glossary)} terms)"):
-                            for term, translation in translator.glossary.items():
-                                st.write(f"**{term}** -> {translation}")
 
                 chapter_status.info(
                     f"**Translated chapter {i + 1}** ({count + 1}/{total_to_translate})"
