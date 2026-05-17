@@ -128,7 +128,7 @@ if not api_key:
     st.stop()
 
 provider = create_provider(provider_name, api_key=api_key, model=model)
-translator = ChapterTranslator(provider=provider)
+translator = ChapterTranslator(provider=provider, max_tokens=30000)
 
 # --- All provider configs for preview mode ---
 ALL_PROVIDERS = {
@@ -263,7 +263,7 @@ if _all_cache_text_parts:
     )
 else:
     _cache_btn_slot.download_button(
-        label="💾 Cache",
+        label="💾",
         data="",
         file_name="empty",
         mime="text/plain",
@@ -368,6 +368,10 @@ if start_button:
     total_to_translate = len(selected_indices)
     count = 0
     all_translations = {}  # {chapter_idx: (raw, translated)}
+    
+    # Track batches for accurate progress
+    _total_batches_completed = [0]
+    _total_batches = [0]
 
     status.info(f"Translating {total_to_translate} chapter(s) ...")
     for i in selected_indices:
@@ -379,6 +383,18 @@ if start_button:
             _acc.append(resp)
             _save_raw_responses(file_hash, _idx, provider_name, model, _acc)
         translator.on_response = _on_resp
+        
+        # Batch progress callback
+        def _on_batch(current, total, _chapter_idx=i):
+            _total_batches_completed[0] += 1
+            if _total_batches[0] > 0:
+                pct = int((_total_batches_completed[0] / _total_batches[0]) * 100)
+                progress_bar.progress(pct)
+                chapter_status.info(
+                    f"**Chapter {_chapter_idx + 1}**: batch {current}/{total} "
+                    f"({_total_batches_completed[0]}/{_total_batches[0]} total batches)"
+                )
+        translator.on_batch_progress = _on_batch
 
         try:
             cached = _load_cached(file_hash, i, provider_name, model)
@@ -389,13 +405,24 @@ if start_button:
                     f"**Chapter {i + 1}** loaded from cache ({count + 1}/{total_to_translate})"
                 )
             else:
-                raw_sections, translated_sections = translator.translate(chapter)
-                # Cache parsed result
+                # Get raw sections from chapter
+                soup = BeautifulSoup(chapter.content, "html.parser")
+                raw_sections = []
+                for tag in soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"]):
+                    raw_sections.append(tag.get_text(strip=True))
+
+                # Calculate batches for this chapter to update total
+                _batches = translator._make_batches(raw_sections)
+                _total_batches[0] += len(_batches)
+
+                # Translate only (without applying to soup) and cache immediately
+                translated_sections = translator.translate_only(raw_sections)
                 _save_cached(file_hash, i, provider_name, model, raw_sections, translated_sections)
 
-                chapter_status.info(
-                    f"**Translated chapter {i + 1}** ({count + 1}/{total_to_translate})"
-                )
+                # Now apply to soup (this might fail, but cache is already saved)
+                formatted_sections = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
+                translator._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
+                chapter.content = str(soup).encode("utf-8")
 
             all_translations[i] = (raw_sections, translated_sections)
 
@@ -406,7 +433,6 @@ if start_button:
                 _save_raw_responses(file_hash, i, provider_name, model, translator._raw_responses)
 
         count += 1
-        progress_bar.progress(int((count / total_to_translate) * 100))
 
     # --- Build EPUB ---
     default_out_name = f"{name_root}_de.epub"

@@ -10,11 +10,12 @@ SECTION_DELIMITER = "⟪§⟫"
 
 
 class ChapterTranslator:
-    def __init__(self, provider: LLMProvider, max_tokens: int = 100000, on_response=None):
+    def __init__(self, provider: LLMProvider, max_tokens: int = 100000, on_response=None, on_batch_progress=None):
         self.provider = provider
         self.max_tokens = max_tokens
         self._raw_responses: List[str] = []
         self.on_response = on_response
+        self.on_batch_progress = on_batch_progress
 
     def translate(self, chapter: EpubHtml):
         """Translate chapter in-place. Returns (raw_sections, translated_sections)."""
@@ -33,6 +34,11 @@ class ChapterTranslator:
         self._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
         chapter.content = str(soup).encode("utf-8")
         return raw_sections, translated_sections
+
+    def translate_only(self, raw_sections: List[str]) -> List[str]:
+        """Translate raw sections without applying to soup. Returns translated_sections."""
+        self._raw_responses = []
+        return self._translate_chapter(raw_sections)
 
     def apply_cached(self, chapter: EpubHtml, raw_sections: List[str], translated_sections: List[str]):
         """Apply previously cached translations to a chapter without calling LLM."""
@@ -76,8 +82,10 @@ class ChapterTranslator:
 
         batches = self._make_batches(raw_sections)
         translated_sections = []
-        for batch in batches:
+        for batch_idx, batch in enumerate(batches):
             translated_sections.extend(self._translate_batch(batch))
+            if self.on_batch_progress:
+                self.on_batch_progress(batch_idx + 1, len(batches))
 
         if len(translated_sections) != len(raw_sections):
             raise Exception(
@@ -121,25 +129,21 @@ class ChapterTranslator:
 
     def _call_llm(self, chapter_text: str, section_count: int) -> str:
         system_msg = (
-            "You are a professional book translator. You translate text into German.\n"
-            "Rules:\n"
-            "- Keep the translation close to the original meaning.\n"
-            "- Use standard modern German grammar and vocabulary (A2–B1 level).\n"
-            "- Avoid poetic, archaic, or overly complex phrasing.\n"
-            "- Keep names, places, and book-specific terms consistent.\n"
-            "- Do not add explanations, notes, or extra text.\n"
-            f"- The text has sections separated by the delimiter {SECTION_DELIMITER}\n"
-            f"- Translate the text naturally as a whole, keeping full context across sections.\n"
-            f"- Preserve EVERY {SECTION_DELIMITER} delimiter exactly as-is in your output.\n"
-            f"- The output must have exactly {section_count} sections "
-            f"(i.e. exactly {section_count - 1} delimiters).\n"
-            "- Output ONLY the translated text with delimiters. No other text."
+            "You are a professional book translator. Translate the user's text into German.\n"
+            "- Standard modern German, A2–B1 level. No archaic or complex phrasing.\n"
+            "- Stay close to the original meaning. Keep names, places, and terms consistent.\n"
+            "- Output ONLY the translated text. No notes, explanations, or added text."
         )
 
         user_msg = (
-            f"Translate the following chapter into German. "
-            f"Keep the {SECTION_DELIMITER} delimiters in place:\n\n"
+            f"Translate the following text. It contains exactly {section_count} sections "
+            f"separated by '{SECTION_DELIMITER}'.\n"
+            f"RULES: Preserve every '{SECTION_DELIMITER}' exactly as-is. "
+            f"Output must have exactly {section_count - 1} delimiters ({section_count} sections). "
+            f"Do not merge or drop any section.\n\n"
             f"{chapter_text}"
+            f"\n\n[REMINDER: {section_count} sections, {section_count - 1} delimiters ('{SECTION_DELIMITER}'). "
+            f"No added text.]"
         )
 
         messages = [
