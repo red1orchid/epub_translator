@@ -1,8 +1,11 @@
 import os
+import re
 import tempfile
 import base64
 import hashlib
 import json
+import time
+import traceback
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -18,7 +21,7 @@ from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_opt
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.2"
 
 # --- Session state ---
 for _key, _default in [
@@ -77,6 +80,34 @@ def _load_request_keys(file_hash, chapter_idx, prov, mdl):
         except Exception:
             return None
     return None
+
+
+def _error_report_path(file_hash, chapter_idx, prov, mdl):
+    h = hashlib.sha256(f"{file_hash}:{chapter_idx}:{prov}:{mdl}".encode()).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"{h}_error.txt")
+
+
+def _save_error_report(file_hash, chapter_idx, prov, mdl, text):
+    with open(_error_report_path(file_hash, chapter_idx, prov, mdl), "w") as f:
+        f.write(text)
+
+
+def _load_error_report(file_hash, chapter_idx, prov, mdl):
+    p = _error_report_path(file_hash, chapter_idx, prov, mdl)
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                return f.read()
+        except Exception:
+            return None
+    return None
+
+
+def _clear_error_report(file_hash, chapter_idx, prov, mdl):
+    try:
+        os.remove(_error_report_path(file_hash, chapter_idx, prov, mdl))
+    except FileNotFoundError:
+        pass
 
 
 def _auto_download(data: bytes, filename: str, mime: str):
@@ -169,6 +200,45 @@ if not debug_mode:
     provider = CachedLLMProvider(provider, cache=response_cache)
 
 translator = ChapterTranslator(provider=provider, max_tokens=4000)
+
+
+def _expected_sections(user_msg):
+    """Section count a batch request asked for. The prompt states it explicitly;
+    counting delimiters would overcount (the instructions mention the delimiter too)."""
+    match = re.search(r"exactly (\d+) sections", user_msg)
+    return int(match.group(1)) if match else None
+
+
+def _build_error_report(chapter_num, exc_traceback, request_keys):
+    """Plain-text debug report: full traceback plus each batch's request/response."""
+    lines = [
+        f"EPUB Translator v{APP_VERSION} — error report",
+        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Provider / model: {provider_name} / {model}",
+        f"Chapter: {chapter_num}",
+        "",
+        "=== Exception (full traceback) ===",
+        exc_traceback.rstrip(),
+        "",
+    ]
+    for bi, key in enumerate(request_keys or []):
+        entry = response_cache.load(key)
+        if entry is None:
+            lines.append(f"=== Batch {bi + 1}: no cached response (LLM call never completed) ===")
+            lines.append("")
+            continue
+        user_msg = next((m["content"] for m in entry["messages"] if m["role"] == "user"), "")
+        expected = _expected_sections(user_msg) or "?"
+        got = entry["response"].count(SECTION_DELIMITER) + 1
+        lines += [
+            f"=== Batch {bi + 1} — LLM RESPONSE (expected {expected} sections, got {got}) ===",
+            entry["response"],
+            "",
+            f"=== Batch {bi + 1} — REQUEST (user message) ===",
+            user_msg,
+            "",
+        ]
+    return "\n".join(lines)
 
 # --- All provider configs for preview mode ---
 ALL_PROVIDERS = {
@@ -431,6 +501,7 @@ if start_button:
     total_to_translate = len(selected_indices)
     count = 0
     all_translations = {}  # {chapter_idx: (raw, translated)}
+    failed_chapters = []
 
     # Track batches for accurate progress
     _total_batches_completed = [0]
@@ -512,34 +583,57 @@ if start_button:
                 _status(f"Chapter {i + 1} · done")
 
             all_translations[i] = (raw_sections, translated_sections)
+            _clear_error_report(file_hash, i, provider_name, model)
 
         except Exception as exc:
+            failed_chapters.append(i + 1)
+            _tb = traceback.format_exc()
+            _report = _build_error_report(i + 1, _tb, _chapter_keys)
+            _save_error_report(file_hash, i, provider_name, model, _report)
+
             st.error(f"Error translating chapter {i + 1}: {exc}")
-            st.warning(
-                f"The raw LLM responses for chapter {i + 1} are cached on disk. "
-                f"Use **Fix failed chapters** below to inspect/edit them, then press "
-                f"Start translation again — cached batches are replayed for free."
+            with st.expander(f"Error details — chapter {i + 1}"):
+                st.code(_tb)
+            st.download_button(
+                "⬇️ Download error report (.txt)",
+                data=_report.encode("utf-8"),
+                file_name=f"chapter_{i + 1}_error.txt",
+                mime="text/plain",
+                key=f"err_dl_run_{i}",
             )
+            # Only mention the response cache if something actually reached it
+            if any(response_cache.load(k) for k in _chapter_keys):
+                st.warning(
+                    f"The raw LLM responses for chapter {i + 1} are cached on disk. "
+                    f"Use **Fix failed chapters** below to inspect/edit them, then press "
+                    f"Start translation again — cached batches are replayed for free."
+                )
 
         count += 1
 
-    # --- Build EPUB ---
-    status.info("Building EPUB ...")
+    # --- Build EPUB (only if at least one chapter was translated) ---
     default_out_name = f"{name_root}_de.epub"
     epub_built = False
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as out_tf:
-            output_temp_path = out_tf.name
-        epub.write_epub(output_temp_path, book, {"plugins": []})
-        with open(output_temp_path, "rb") as f:
-            out_bytes = f.read()
-        os.remove(output_temp_path)
+    if all_translations:
+        status.info("Building EPUB ...")
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as out_tf:
+                output_temp_path = out_tf.name
+            epub.write_epub(output_temp_path, book, {"plugins": []})
+            with open(output_temp_path, "rb") as f:
+                out_bytes = f.read()
+            os.remove(output_temp_path)
 
-        st.session_state.output_epub_bytes = out_bytes
-        st.session_state.output_filename = default_out_name
-        epub_built = True
-    except Exception as exc:
-        st.error(f"Failed to build EPUB: {exc}")
+            st.session_state.output_epub_bytes = out_bytes
+            st.session_state.output_filename = default_out_name
+            epub_built = True
+        except Exception as exc:
+            st.error(f"Failed to build EPUB: {exc}")
+            with st.expander("Error details — EPUB build"):
+                st.code(traceback.format_exc())
+    else:
+        status.empty()
+        st.error("No chapters were translated — nothing to download.")
 
     progress_bar.progress(100)
 
@@ -551,7 +645,14 @@ if start_button:
 
     if epub_built:
         status.empty()
-        st.success(f"Translation finished: {count} chapter(s) translated.")
+        if failed_chapters:
+            _failed_list = ", ".join(str(n) for n in failed_chapters)
+            st.warning(
+                f"Translation finished with errors: {len(all_translations)} chapter(s) translated, "
+                f"{len(failed_chapters)} failed (chapter(s) {_failed_list} left untranslated in the output)."
+            )
+        else:
+            st.success(f"Translation finished: {len(all_translations)} chapter(s) translated.")
         # Auto-trigger download so the file is saved before user switches away
         _auto_download(out_bytes, default_out_name, "application/epub+zip")
         st.download_button(
@@ -587,13 +688,22 @@ if _debuggable:
     )
     for _i, _keys in _debuggable:
         with st.expander(f"Chapter {_i + 1} — {len(_keys)} cached batch(es)"):
+            _report_txt = _load_error_report(file_hash, _i, provider_name, model)
+            if _report_txt:
+                st.download_button(
+                    "⬇️ Download error report (.txt)",
+                    data=_report_txt.encode("utf-8"),
+                    file_name=f"chapter_{_i + 1}_error.txt",
+                    mime="text/plain",
+                    key=f"err_dl_fix_{_i}",
+                )
             for _bi, _key in enumerate(_keys):
                 _entry = response_cache.load(_key)
                 if _entry is None:
                     st.warning(f"Batch {_bi + 1}: no cached response (the LLM call never completed — it will be re-sent).")
                     continue
                 _user_msg = next((m["content"] for m in _entry["messages"] if m["role"] == "user"), "")
-                _expected = _user_msg.count(SECTION_DELIMITER) + 1
+                _expected = _expected_sections(_user_msg)
                 _got = _entry["response"].count(SECTION_DELIMITER) + 1
                 _ok = _expected == _got
                 st.markdown(

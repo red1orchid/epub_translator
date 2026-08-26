@@ -50,7 +50,13 @@ class AnthropicProvider(LLMProvider):
         response = self.client.messages.create(**kwargs)
         # Newer models (e.g. claude-opus-5) think by default: content may start
         # with thinking blocks, so collect text blocks instead of content[0]
-        return "".join(block.text for block in response.content if block.type == "text")
+        text = "".join(block.text for block in response.content if block.type == "text")
+        if not text:
+            raise RuntimeError(
+                f"LLM response contains no text (stop_reason={response.stop_reason}, "
+                f"blocks: {[block.type for block in response.content]})"
+            )
+        return text
 
 
 class DebugProvider(LLMProvider):
