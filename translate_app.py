@@ -13,11 +13,12 @@ from bs4 import BeautifulSoup
 from chapter_translator import ChapterTranslator, SECTION_DELIMITER
 from llm_cache import CachedLLMProvider, LLMResponseCache, estimate_tokens, format_tokens
 from llm_provider import create_provider
+from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_options
 
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 # --- Session state ---
 for _key, _default in [
@@ -120,12 +121,37 @@ provider_name = st.selectbox("LLM Provider", ["openai", "anthropic"])
 
 if provider_name == "openai":
     api_key = st.secrets.get("openai_key", "")
-    default_model = st.secrets.get("openai_model", "gpt-5.1")
+    secret_model = st.secrets.get("openai_model", "")
 elif provider_name == "anthropic":
     api_key = st.secrets.get("anthropic_key", "")
-    default_model = st.secrets.get("anthropic_model", "claude-sonnet-4.6")
+    secret_model = st.secrets.get("anthropic_model", "")
 
-model = st.text_input("Model", value=default_model)
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _cached_live_prices():
+    try:
+        return fetch_live_prices()
+    except Exception:
+        return None
+
+
+_live_prices = _cached_live_prices()
+_model_options = get_model_options(provider_name, _live_prices)
+_model_ids = [o["id"] for o in _model_options]
+_model_labels = [o["label"] for o in _model_options]
+_CUSTOM = "Custom model…"
+
+_default_idx = _model_ids.index(secret_model) if secret_model in _model_ids else 0
+_selected_label = st.selectbox("Model", options=_model_labels + [_CUSTOM], index=_default_idx)
+if _selected_label == _CUSTOM:
+    model = st.text_input("Custom model ID", value=secret_model or _model_ids[0])
+else:
+    model = _model_ids[_model_labels.index(_selected_label)]
+
+if _live_prices:
+    st.caption("Prices per 1M tokens (input/output), fetched live from LiteLLM's price table.")
+else:
+    st.caption(f"Prices per 1M tokens (input/output), as of {FALLBACK_PRICES_DATE} (live price fetch unavailable).")
 
 # --- Debug mode ---
 debug_mode = st.checkbox("Debug mode (show LLM request without sending)", value=False)
@@ -154,7 +180,7 @@ ALL_PROVIDERS = {
     "anthropic": {
         "key_secret": "anthropic_key",
         "model_secret": "anthropic_model",
-        "default_model": "claude-sonnet-4.6",
+        "default_model": "claude-sonnet-4-6",
     },
 }
 
@@ -223,6 +249,24 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tf:
 
 # load book
 book = epub.read_epub(temp_input_path)
+
+
+# ebooklib 0.20 parses the TOC from nav.xhtml with uid=None on every link;
+# writing the NCX then crashes on those (navPoint id must be a string).
+# Assign uids so books shipping both nav.xhtml and toc.ncx can be rebuilt.
+def _ensure_toc_uids(entries, _counter=None):
+    if _counter is None:
+        _counter = [0]
+    for entry in entries:
+        if isinstance(entry, (tuple, list)):
+            _ensure_toc_uids(entry[1], _counter)
+        else:
+            _counter[0] += 1
+            if getattr(entry, "uid", None) in (None, ""):
+                entry.uid = f"navpoint-{_counter[0]}"
+
+
+_ensure_toc_uids(book.toc)
 
 # get chapter/document items, excluding navigation documents
 all_items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))

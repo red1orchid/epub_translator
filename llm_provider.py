@@ -21,7 +21,8 @@ class OpenAIProvider(LLMProvider):
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            max_tokens=16384,
+            # gpt-5.x and o-series reject the legacy max_tokens parameter
+            max_completion_tokens=16384,
         )
         return completion.choices[0].message.content
 
@@ -47,7 +48,9 @@ class AnthropicProvider(LLMProvider):
             kwargs["system"] = system_msg
 
         response = self.client.messages.create(**kwargs)
-        return response.content[0].text
+        # Newer models (e.g. claude-opus-5) think by default: content may start
+        # with thinking blocks, so collect text blocks instead of content[0]
+        return "".join(block.text for block in response.content if block.type == "text")
 
 
 class DebugProvider(LLMProvider):

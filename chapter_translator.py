@@ -53,20 +53,10 @@ class ChapterTranslator:
             if tag.name == "li" and tag.find("a"):
                 a_tag = tag.find("a")
                 a_tag.string = new_text
-            elif tag.has_attr("id"):
-                # Preserve tags with id (navigation anchors) but still show translation
-                original_id = tag["id"]
-                tag.string = new_text
-                tag["id"] = original_id
-
-                original_tag = soup.new_tag(tag.name)
-                original_tag.append(NavigableString(f"[{original_text}]"))
-                if tag.parent:
-                    tag.insert_after(original_tag)
-                else:
-                    tag.append(original_tag)
             else:
-                tag.string = new_text
+                # Attributes (incl. the tag's own id) survive; descendant anchors
+                # are preserved by _set_translated_text so TOC fragments keep working
+                self._set_translated_text(tag, new_text)
 
                 original_tag = soup.new_tag(tag.name)
                 original_tag.append(NavigableString(f"[{original_text}]"))
@@ -74,6 +64,20 @@ class ChapterTranslator:
                     tag.insert_after(original_tag)
                 else:
                     tag.append(original_tag)
+
+    @staticmethod
+    def _set_translated_text(tag, new_text):
+        """Replace a tag's content with translated text, keeping descendant
+        elements that carry an id (e.g. <a id="ch3"/> inside a heading) —
+        they are navigation targets and wiping them breaks the book's TOC."""
+        anchors = tag.find_all(attrs={"id": True})
+        for anchor in anchors:
+            anchor.extract()
+            anchor.clear()  # its text was part of the original; translation replaces it
+        tag.clear()
+        for anchor in anchors:
+            tag.append(anchor)
+        tag.append(NavigableString(new_text))
 
     def _translate_chapter(self, raw_sections: List[str]) -> List[str]:
         """Translate entire chapter as flowing text, split back by delimiters."""
