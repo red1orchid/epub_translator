@@ -10,13 +10,14 @@ from ebooklib import epub
 import ebooklib
 from bs4 import BeautifulSoup
 
-from chapter_translator import ChapterTranslator
+from chapter_translator import ChapterTranslator, SECTION_DELIMITER
+from llm_cache import CachedLLMProvider, LLMResponseCache, estimate_tokens, format_tokens
 from llm_provider import create_provider
 
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 # --- Session state ---
 for _key, _default in [
@@ -55,22 +56,25 @@ def _save_cached(file_hash, chapter_idx, prov, mdl, raw, translated):
         json.dump({"raw": raw, "translated": translated}, f, ensure_ascii=False)
 
 
-def _raw_response_path(file_hash, chapter_idx, prov, mdl):
+def _request_keys_path(file_hash, chapter_idx, prov, mdl):
+    """Path of the file listing LLM response-cache keys used by a chapter."""
     h = hashlib.sha256(f"{file_hash}:{chapter_idx}:{prov}:{mdl}".encode()).hexdigest()[:16]
-    return os.path.join(CACHE_DIR, f"{h}_raw.txt")
+    return os.path.join(CACHE_DIR, f"{h}_requests.json")
 
 
-def _save_raw_responses(file_hash, chapter_idx, prov, mdl, responses):
-    p = _raw_response_path(file_hash, chapter_idx, prov, mdl)
-    with open(p, "w") as f:
-        f.write("\n===BATCH===\n".join(responses))
+def _save_request_keys(file_hash, chapter_idx, prov, mdl, keys):
+    with open(_request_keys_path(file_hash, chapter_idx, prov, mdl), "w") as f:
+        json.dump(keys, f)
 
 
-def _load_raw_responses(file_hash, chapter_idx, prov, mdl):
-    p = _raw_response_path(file_hash, chapter_idx, prov, mdl)
+def _load_request_keys(file_hash, chapter_idx, prov, mdl):
+    p = _request_keys_path(file_hash, chapter_idx, prov, mdl)
     if os.path.exists(p):
-        with open(p) as f:
-            return f.read()
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except Exception:
+            return None
     return None
 
 
@@ -123,11 +127,21 @@ elif provider_name == "anthropic":
 
 model = st.text_input("Model", value=default_model)
 
+# --- Debug mode ---
+debug_mode = st.checkbox("Debug mode (show LLM request without sending)", value=False)
+
 if not api_key:
     st.error(f"No API key found for {provider_name}. Add it to .streamlit/secrets.toml")
     st.stop()
 
-provider = create_provider(provider_name, api_key=api_key, model=model)
+provider = create_provider(provider_name, api_key=api_key, model=model, debug=debug_mode)
+
+# Raw LLM response cache: identical requests are replayed from disk for free,
+# and responses are persisted the instant they arrive (before parsing can fail).
+response_cache = LLMResponseCache(CACHE_DIR, namespace=f"{provider_name}:{model}")
+if not debug_mode:
+    provider = CachedLLMProvider(provider, cache=response_cache)
+
 translator = ChapterTranslator(provider=provider, max_tokens=4000)
 
 # --- All provider configs for preview mode ---
@@ -248,9 +262,13 @@ for _i in range(n_chapters):
             f"{t}\n[{o}]\n" for o, t in zip(_r, _t)
         ))
     else:
-        _raw_resp = _load_raw_responses(file_hash, _i, provider_name, model)
-        if _raw_resp:
-            _all_cache_text_parts.append(f"=== Chapter {_i + 1} (raw LLM) ===\n{_raw_resp}\n")
+        _keys = _load_request_keys(file_hash, _i, provider_name, model)
+        if _keys:
+            _responses = [e["response"] for e in (response_cache.load(k) for k in _keys) if e]
+            if _responses:
+                _all_cache_text_parts.append(
+                    f"=== Chapter {_i + 1} (raw LLM) ===\n" + "\n===BATCH===\n".join(_responses) + "\n"
+                )
 
 if _all_cache_text_parts:
     _cache_btn_slot.download_button(
@@ -308,6 +326,7 @@ with col_preview:
 progress_bar = st.progress(0)
 status = st.empty()
 chapter_status = st.empty()
+log_slot = st.empty()
 
 # We'll store translated book in a temporary file and then offer download
 output_temp_path = None
@@ -368,44 +387,60 @@ if start_button:
     total_to_translate = len(selected_indices)
     count = 0
     all_translations = {}  # {chapter_idx: (raw, translated)}
-    
+
     # Track batches for accurate progress
     _total_batches_completed = [0]
     _total_batches = [0]
+    _log_lines = []
 
-    status.info(f"Translating {total_to_translate} chapter(s) ...")
+    def _status(msg):
+        chapter_status.info(msg)
+        _log_lines.append(msg)
+        log_slot.markdown("\n".join(f"- {l}" for l in _log_lines[-15:]))
+
     for i in selected_indices:
         chapter = chapters[i]
+        status.info(f"Translating chapter {i + 1} ({count + 1}/{total_to_translate}) ...")
 
-        # Save raw LLM response to disk THE INSTANT it arrives (before parsing)
-        _resp_acc = []
-        def _on_resp(resp, _idx=i, _acc=_resp_acc):
-            _acc.append(resp)
-            _save_raw_responses(file_hash, _idx, provider_name, model, _acc)
-        translator.on_response = _on_resp
-        
+        # Per-chapter batch tracking (for status messages)
+        _chapter_batches = [0]
+        _chapter_batch_done = [0]
+        _chapter_keys = []
+
+        # LLM cache events: record which cache entries this chapter used
+        # (so failed chapters can be debugged/edited below) and report activity
+        def _on_llm_event(kind, key, tokens, _idx=i, _keys=_chapter_keys,
+                          _nb=_chapter_batches, _done=_chapter_batch_done):
+            if key not in _keys:
+                _keys.append(key)
+                _save_request_keys(file_hash, _idx, provider_name, model, _keys)
+            _batch = f"batch {_done[0] + 1}/{_nb[0]}"
+            if kind == "cache_hit":
+                _status(f"Chapter {_idx + 1} · {_batch} · reusing cached LLM response ({format_tokens(tokens)}, no API cost)")
+            elif kind == "llm_call":
+                _status(f"Chapter {_idx + 1} · {_batch} · LLM call {format_tokens(tokens)} ...")
+            elif kind == "llm_done":
+                _status(f"Chapter {_idx + 1} · {_batch} · response received ({format_tokens(tokens)}), cached to disk")
+        if isinstance(provider, CachedLLMProvider):
+            provider.on_event = _on_llm_event
+
         # Batch progress callback
-        def _on_batch(current, total, _chapter_idx=i):
+        def _on_batch(current, total, _done=_chapter_batch_done):
+            _done[0] = current
             _total_batches_completed[0] += 1
             if _total_batches[0] > 0:
                 pct = int((_total_batches_completed[0] / _total_batches[0]) * 100)
-                progress_bar.progress(pct)
-                chapter_status.info(
-                    f"**Chapter {_chapter_idx + 1}**: batch {current}/{total} "
-                    f"({_total_batches_completed[0]}/{_total_batches[0]} total batches)"
-                )
+                progress_bar.progress(min(pct, 100))
         translator.on_batch_progress = _on_batch
 
         try:
             cached = _load_cached(file_hash, i, provider_name, model)
             if cached:
+                _status(f"Chapter {i + 1} · loading translation from cache (no API cost)")
                 raw_sections, translated_sections = cached
                 translator.apply_cached(chapter, raw_sections, translated_sections)
-                chapter_status.info(
-                    f"**Chapter {i + 1}** loaded from cache ({count + 1}/{total_to_translate})"
-                )
             else:
-                # Get raw sections from chapter
+                _status(f"Chapter {i + 1} · extracting text")
                 soup = BeautifulSoup(chapter.content, "html.parser")
                 raw_sections = []
                 for tag in soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"]):
@@ -413,28 +448,39 @@ if start_button:
 
                 # Calculate batches for this chapter to update total
                 _batches = translator._make_batches(raw_sections)
+                _chapter_batches[0] = len(_batches)
                 _total_batches[0] += len(_batches)
+
+                _status(
+                    f"Chapter {i + 1} · {len(raw_sections)} sections, "
+                    f"{len(_batches)} batch(es), {format_tokens(estimate_tokens(''.join(raw_sections)))} of text"
+                )
 
                 # Translate only (without applying to soup) and cache immediately
                 translated_sections = translator.translate_only(raw_sections)
                 _save_cached(file_hash, i, provider_name, model, raw_sections, translated_sections)
 
                 # Now apply to soup (this might fail, but cache is already saved)
+                _status(f"Chapter {i + 1} · applying translation to chapter HTML")
                 formatted_sections = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
                 translator._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
                 chapter.content = str(soup).encode("utf-8")
+                _status(f"Chapter {i + 1} · done")
 
             all_translations[i] = (raw_sections, translated_sections)
 
         except Exception as exc:
             st.error(f"Error translating chapter {i + 1}: {exc}")
-            # Save raw LLM responses even if parsing/application failed
-            if translator._raw_responses:
-                _save_raw_responses(file_hash, i, provider_name, model, translator._raw_responses)
+            st.warning(
+                f"The raw LLM responses for chapter {i + 1} are cached on disk. "
+                f"Use **Fix failed chapters** below to inspect/edit them, then press "
+                f"Start translation again — cached batches are replayed for free."
+            )
 
         count += 1
 
     # --- Build EPUB ---
+    status.info("Building EPUB ...")
     default_out_name = f"{name_root}_de.epub"
     epub_built = False
     try:
@@ -453,7 +499,14 @@ if start_button:
 
     progress_bar.progress(100)
 
+    # --- Show debug info if in debug mode ---
+    if debug_mode and hasattr(provider, 'last_request') and provider.last_request:
+        st.subheader("🐛 Debug: Last LLM Request")
+        st.json(provider.last_request)
+        st.caption("Note: In debug mode, no actual LLM calls were made. Dummy responses were used.")
+
     if epub_built:
+        status.empty()
         st.success(f"Translation finished: {count} chapter(s) translated.")
         # Auto-trigger download so the file is saved before user switches away
         _auto_download(out_bytes, default_out_name, "application/epub+zip")
@@ -469,6 +522,54 @@ if start_button:
         os.remove(temp_input_path)
     except Exception:
         pass
+
+# ========================
+# Fix failed chapters: inspect/edit cached raw LLM responses and retry for free
+# ========================
+_debuggable = []
+for _i in range(n_chapters):
+    _keys = _load_request_keys(file_hash, _i, provider_name, model)
+    if _keys and _load_cached(file_hash, _i, provider_name, model) is None:
+        _debuggable.append((_i, _keys))
+
+if _debuggable:
+    st.divider()
+    st.subheader("🔧 Fix failed chapters")
+    st.caption(
+        "These chapters got LLM responses, but assembling the translation failed. "
+        "Inspect each batch below, fix the response (usually a missing/extra "
+        f"'{SECTION_DELIMITER}' delimiter), press **Save**, then run **Start translation** "
+        "again — saved batches are replayed from cache without calling the LLM."
+    )
+    for _i, _keys in _debuggable:
+        with st.expander(f"Chapter {_i + 1} — {len(_keys)} cached batch(es)"):
+            for _bi, _key in enumerate(_keys):
+                _entry = response_cache.load(_key)
+                if _entry is None:
+                    st.warning(f"Batch {_bi + 1}: no cached response (the LLM call never completed — it will be re-sent).")
+                    continue
+                _user_msg = next((m["content"] for m in _entry["messages"] if m["role"] == "user"), "")
+                _expected = _user_msg.count(SECTION_DELIMITER) + 1
+                _got = _entry["response"].count(SECTION_DELIMITER) + 1
+                _ok = _expected == _got
+                st.markdown(
+                    f"**Batch {_bi + 1}** — expected **{_expected}** sections, "
+                    f"response has **{_got}** {'✅' if _ok else '❌ (fix the delimiters below)'}"
+                )
+                _edited = st.text_area(
+                    f"Response for batch {_bi + 1}",
+                    value=_entry["response"],
+                    height=220,
+                    key=f"edit_{_key}",
+                    label_visibility="collapsed",
+                )
+                _c1, _c2 = st.columns(2)
+                if _c1.button("💾 Save edited response", key=f"save_{_key}"):
+                    response_cache.update_response(_key, _edited)
+                    st.success("Saved. Press **Start translation** to retry — this batch costs nothing.")
+                if _c2.button("🗑 Discard (re-translate via LLM)", key=f"del_{_key}"):
+                    response_cache.delete(_key)
+                    st.info("Discarded. This batch will be sent to the LLM again on the next run.")
 
 # --- Persistent EPUB download (visible on reruns within same session) ---
 if not start_button and not preview_button:
