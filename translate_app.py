@@ -13,7 +13,7 @@ from ebooklib import epub
 import ebooklib
 from bs4 import BeautifulSoup
 
-from chapter_translator import ChapterTranslator, SECTION_DELIMITER
+from chapter_translator import ChapterTranslator, PROMPT_VERSION, SECTION_DELIMITER
 from llm_cache import CachedLLMProvider, LLMResponseCache, estimate_tokens, format_tokens
 from llm_provider import create_provider
 from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_options
@@ -21,7 +21,7 @@ from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_opt
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.8.1"
 
 # --- Session state ---
 for _key, _default in [
@@ -37,9 +37,16 @@ CACHE_DIR = os.path.join(tempfile.gettempdir(), "epub_translator_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
+def _chapter_key(file_hash, chapter_idx, prov, mdl):
+    """Cache identity of one chapter. Includes PROMPT_VERSION, so editing a
+    prompt invalidates old translations instead of serving them from cache."""
+    return hashlib.sha256(
+        f"{file_hash}:{chapter_idx}:{prov}:{mdl}:{PROMPT_VERSION}".encode()
+    ).hexdigest()[:16]
+
+
 def _disk_cache_path(file_hash, chapter_idx, prov, mdl):
-    h = hashlib.sha256(f"{file_hash}:{chapter_idx}:{prov}:{mdl}".encode()).hexdigest()[:16]
-    return os.path.join(CACHE_DIR, f"{h}.json")
+    return os.path.join(CACHE_DIR, f"{_chapter_key(file_hash, chapter_idx, prov, mdl)}.json")
 
 
 def _load_cached(file_hash, chapter_idx, prov, mdl):
@@ -62,8 +69,9 @@ def _save_cached(file_hash, chapter_idx, prov, mdl, raw, translated):
 
 def _request_keys_path(file_hash, chapter_idx, prov, mdl):
     """Path of the file listing LLM response-cache keys used by a chapter."""
-    h = hashlib.sha256(f"{file_hash}:{chapter_idx}:{prov}:{mdl}".encode()).hexdigest()[:16]
-    return os.path.join(CACHE_DIR, f"{h}_requests.json")
+    return os.path.join(
+        CACHE_DIR, f"{_chapter_key(file_hash, chapter_idx, prov, mdl)}_requests.json"
+    )
 
 
 def _save_request_keys(file_hash, chapter_idx, prov, mdl, keys):
@@ -83,8 +91,9 @@ def _load_request_keys(file_hash, chapter_idx, prov, mdl):
 
 
 def _error_report_path(file_hash, chapter_idx, prov, mdl):
-    h = hashlib.sha256(f"{file_hash}:{chapter_idx}:{prov}:{mdl}".encode()).hexdigest()[:16]
-    return os.path.join(CACHE_DIR, f"{h}_error.txt")
+    return os.path.join(
+        CACHE_DIR, f"{_chapter_key(file_hash, chapter_idx, prov, mdl)}_error.txt"
+    )
 
 
 def _save_error_report(file_hash, chapter_idx, prov, mdl, text):
@@ -130,22 +139,8 @@ def _auto_download(data: bytes, filename: str, mime: str):
     )
 
 
-def _build_raw_text(cache_entries):
-    """Build a plain-text version of all cached translations."""
-    lines = []
-    for ch_idx, (raw, translated) in sorted(cache_entries.items()):
-        lines.append(f"=== Chapter {ch_idx + 1} ===")
-        for orig, trans in zip(raw, translated):
-            lines.append(f"{trans}")
-            lines.append(f"[{orig}]")
-            lines.append("")
-        lines.append("")
-    return "\n".join(lines)
-
-
 st.title("EPUB Chapter Translator")
 st.caption(f"v{APP_VERSION}")
-_cache_btn_slot = st.empty()
 
 # --- Provider / model selection ---
 provider_name = st.selectbox("LLM Provider", ["openai", "anthropic"])
@@ -184,20 +179,17 @@ if _live_prices:
 else:
     st.caption(f"Prices per 1M tokens (input/output), as of {FALLBACK_PRICES_DATE} (live price fetch unavailable).")
 
-# --- Debug mode ---
-debug_mode = st.checkbox("Debug mode (show LLM request without sending)", value=False)
-
 if not api_key:
     st.error(f"No API key found for {provider_name}. Add it to .streamlit/secrets.toml")
     st.stop()
 
-provider = create_provider(provider_name, api_key=api_key, model=model, debug=debug_mode)
-
 # Raw LLM response cache: identical requests are replayed from disk for free,
 # and responses are persisted the instant they arrive (before parsing can fail).
-response_cache = LLMResponseCache(CACHE_DIR, namespace=f"{provider_name}:{model}")
-if not debug_mode:
-    provider = CachedLLMProvider(provider, cache=response_cache)
+response_cache = LLMResponseCache(CACHE_DIR, namespace=f"{provider_name}:{model}:{PROMPT_VERSION}")
+provider = CachedLLMProvider(
+    create_provider(provider_name, api_key=api_key, model=model),
+    cache=response_cache,
+)
 
 translator = ChapterTranslator(provider=provider, max_tokens=4000)
 
@@ -239,21 +231,6 @@ def _build_error_report(chapter_num, exc_traceback, request_keys):
             "",
         ]
     return "\n".join(lines)
-
-# --- All provider configs for preview mode ---
-ALL_PROVIDERS = {
-    "openai": {
-        "key_secret": "openai_key",
-        "model_secret": "openai_model",
-        "default_model": "gpt-5.1",
-    },
-    "anthropic": {
-        "key_secret": "anthropic_key",
-        "model_secret": "anthropic_model",
-        "default_model": "claude-sonnet-4-6",
-    },
-}
-
 
 def _get_chapter_label(idx: int, chapter_item) -> str:
     """Return a human-readable label: 'Chapter N: <heading or first line>'."""
@@ -366,44 +343,6 @@ n_chapters = len(chapters)
 
 st.write(f"Found **{n_chapters}** translatable chapter(s).")
 
-# --- Fill cache download button in header ---
-_all_cache_text_parts = []
-for _i in range(n_chapters):
-    _cached = _load_cached(file_hash, _i, provider_name, model)
-    if _cached:
-        _r, _t = _cached
-        _all_cache_text_parts.append(f"=== Chapter {_i + 1} ===\n" + "\n".join(
-            f"{t}\n[{o}]\n" for o, t in zip(_r, _t)
-        ))
-    else:
-        _keys = _load_request_keys(file_hash, _i, provider_name, model)
-        if _keys:
-            _responses = [e["response"] for e in (response_cache.load(k) for k in _keys) if e]
-            if _responses:
-                _all_cache_text_parts.append(
-                    f"=== Chapter {_i + 1} (raw LLM) ===\n" + "\n===BATCH===\n".join(_responses) + "\n"
-                )
-
-if _all_cache_text_parts:
-    _cache_btn_slot.download_button(
-        label="💾",
-        data="\n".join(_all_cache_text_parts).encode("utf-8"),
-        file_name=f"{name_root}_cache.txt",
-        mime="text/plain",
-        help="Download cached translations",
-        key="cache_dl_header",
-    )
-else:
-    _cache_btn_slot.download_button(
-        label="💾",
-        data="",
-        file_name="empty",
-        mime="text/plain",
-        help="No cached translations yet",
-        disabled=True,
-        key="cache_dl_header",
-    )
-
 # --- Chapter multiselect with readable labels ---
 chapter_labels = [_get_chapter_label(i, ch) for i, ch in enumerate(chapters)]
 
@@ -463,34 +402,23 @@ if preview_button:
         st.stop()
 
     st.subheader(f"Preview – {chapter_labels[first_idx]}")
-    st.caption(f"Translating {len(preview_sections)} section(s) with every available model.")
+    st.caption(
+        f"Translating {len(preview_sections)} section(s) with {provider_name} / {model} "
+        f"(~{estimate_tokens(''.join(preview_sections)) // 1000 + 1}k tokens)."
+    )
 
-    # Build a provider for every configured key
-    preview_providers = {}
-    for pname, cfg in ALL_PROVIDERS.items():
-        pkey = st.secrets.get(cfg["key_secret"], "")
-        if not pkey:
-            continue
-        pmodel = st.secrets.get(cfg["model_secret"], cfg["default_model"])
-        preview_providers[f"{pname} / {pmodel}"] = create_provider(pname, api_key=pkey, model=pmodel)
-
-    if not preview_providers:
-        st.error("No API keys configured. Add them to .streamlit/secrets.toml")
-        st.stop()
-
-    # Translate with each provider and show side-by-side
-    cols = st.columns(len(preview_providers))
-    for col, (label, prov) in zip(cols, preview_providers.items()):
-        with col:
-            st.markdown(f"**{label}**")
-            try:
-                tmp_translator = ChapterTranslator(provider=prov)
-                translated = tmp_translator._translate_batch(preview_sections)
-                for orig, trans in zip(preview_sections, translated):
-                    st.markdown(f"**→** {trans}")
-                    st.caption(orig)
-            except Exception as exc:
-                st.error(f"Error: {exc}")
+    # Uses the selected provider through the response cache, so repeating a
+    # preview of the same sections costs nothing.
+    try:
+        with st.spinner("Calling LLM ..."):
+            translated = translator._translate_batch(preview_sections)
+        for orig, trans in zip(preview_sections, translated):
+            st.markdown(f"**→** {trans}")
+            st.caption(orig)
+    except Exception as exc:
+        st.error(f"Error: {exc}")
+        with st.expander("Error details"):
+            st.code(traceback.format_exc())
 
     st.stop()
 
@@ -536,8 +464,7 @@ if start_button:
                 _status(f"Chapter {_idx + 1} · {_batch} · LLM call {format_tokens(tokens)} ...")
             elif kind == "llm_done":
                 _status(f"Chapter {_idx + 1} · {_batch} · response received ({format_tokens(tokens)}), cached to disk")
-        if isinstance(provider, CachedLLMProvider):
-            provider.on_event = _on_llm_event
+        provider.on_event = _on_llm_event
 
         # Batch progress callback
         def _on_batch(current, total, _done=_chapter_batch_done):
@@ -636,12 +563,6 @@ if start_button:
         st.error("No chapters were translated — nothing to download.")
 
     progress_bar.progress(100)
-
-    # --- Show debug info if in debug mode ---
-    if debug_mode and hasattr(provider, 'last_request') and provider.last_request:
-        st.subheader("🐛 Debug: Last LLM Request")
-        st.json(provider.last_request)
-        st.caption("Note: In debug mode, no actual LLM calls were made. Dummy responses were used.")
 
     if epub_built:
         status.empty()

@@ -1,3 +1,4 @@
+import hashlib
 import re
 from typing import List
 
@@ -7,6 +8,72 @@ from ebooklib.epub import EpubHtml
 from llm_provider import LLMProvider
 
 SECTION_DELIMITER = "⟪§⟫"
+
+SYSTEM_PROMPT = (
+    "You translate books into simple German for adult learners at CEFR level "
+    "B1. B1 is a hard ceiling: never write a sentence that a B1 learner "
+    "cannot read.\n"
+    "\n"
+    "PRIORITY: keep the meaning, not the sentence structure. When a faithful "
+    "complex sentence and a simple B1 sentence conflict, always choose the "
+    "simple one. Simplify the wording — never leave out content.\n"
+    "\n"
+    "HOW TO WRITE B1 GERMAN:\n"
+    "- Short sentences, 8-15 words. Split every long original sentence into "
+    "two or three German sentences.\n"
+    "- At most one subordinate clause (Nebensatz) per sentence. Never nest them.\n"
+    "- Use frequent, everyday words. Replace rare, literary or Latinate words "
+    "with common ones (e.g. 'zeigen' not 'demonstrieren').\n"
+    "- Prefer active voice and verbal style. Simple werden-Passiv is fine when "
+    "it is the natural choice ('Das Haus wurde verkauft', 'er wurde geboren'). "
+    "Never use Passiv with modal verbs ('muss beachtet werden') or Nominalstil "
+    "('er untersuchte das Haus', not 'die Untersuchung des Hauses erfolgte').\n"
+    "- Never use extended participial attributes ('der von allen bewunderte "
+    "Mann'), Konjunktiv I/II, or chained Genitives.\n"
+    "- Simple connectors only: und, aber, weil, denn, wenn, dann, danach, "
+    "obwohl, trotzdem, deshalb. Never obgleich, indessen, wenngleich, "
+    "dessen ungeachtet, nichtsdestotrotz.\n"
+    "- Präteritum only for frequent verbs (war, hatte, konnte, wollte, sagte, "
+    "ging, kam, sah); otherwise use Perfekt.\n"
+    "- Keep names, places and recurring terms consistent.\n"
+    "\n"
+    "EXAMPLE\n"
+    "Too complex (B2/C1): 'Nachdem er die von seinem Vater hinterlassenen "
+    "Unterlagen geprüft hatte, gelangte er zu der Überzeugung, dass eine "
+    "Rückkehr unmöglich sei.'\n"
+    "Correct (B1): 'Er prüfte die Unterlagen von seinem Vater. Danach war er "
+    "sicher: Er konnte nicht zurückkommen.'\n"
+    "\n"
+    "Output ONLY the German translation. No notes, no explanations, no added text."
+)
+
+# The literal "exactly {section_count} sections" phrasing is parsed back out of
+# the request by the app (to show expected/actual counts) — keep it intact.
+USER_PROMPT_TEMPLATE = (
+    "Translate the following text into German at CEFR level B1 (never above B1).\n"
+    "It contains exactly {section_count} sections separated by '{delimiter}'.\n"
+    "RULES:\n"
+    "- Preserve every '{delimiter}' exactly as-is. Output must have exactly "
+    "{delimiter_count} delimiters ({section_count} sections). "
+    "Do not merge or drop any section.\n"
+    "- Inside a section you may split one long sentence into several short ones. "
+    "That does not change the number of sections.\n"
+    "- Check every sentence before you answer: longer than 15 words, more than one "
+    "Nebensatz, or a word a B1 learner would not know? Rewrite it simpler.\n"
+    "\n"
+    "{chapter_text}\n"
+    "\n"
+    "[REMINDER: {section_count} sections, {delimiter_count} delimiters "
+    "('{delimiter}'). German at B1, never above: short sentences, common words, "
+    "no Nominalstil, no participial attributes. No added text.]"
+)
+
+# Editing either prompt above changes this automatically, which invalidates the
+# on-disk caches — otherwise chapters translated with an older prompt would keep
+# being served from cache and the new instructions would appear to do nothing.
+PROMPT_VERSION = hashlib.sha256(
+    (SYSTEM_PROMPT + USER_PROMPT_TEMPLATE).encode("utf-8")
+).hexdigest()[:8]
 
 
 class ChapterTranslator:
@@ -132,26 +199,15 @@ class ChapterTranslator:
         return batches
 
     def _call_llm(self, chapter_text: str, section_count: int) -> str:
-        system_msg = (
-            "You are a professional book translator. Translate the user's text into German.\n"
-            "- Standard modern German, A2–B1 level. No archaic or complex phrasing.\n"
-            "- Stay close to the original meaning. Keep names, places, and terms consistent.\n"
-            "- Output ONLY the translated text. No notes, explanations, or added text."
-        )
-
-        user_msg = (
-            f"Translate the following text. It contains exactly {section_count} sections "
-            f"separated by '{SECTION_DELIMITER}'.\n"
-            f"RULES: Preserve every '{SECTION_DELIMITER}' exactly as-is. "
-            f"Output must have exactly {section_count - 1} delimiters ({section_count} sections). "
-            f"Do not merge or drop any section.\n\n"
-            f"{chapter_text}"
-            f"\n\n[REMINDER: {section_count} sections, {section_count - 1} delimiters ('{SECTION_DELIMITER}'). "
-            f"No added text.]"
+        user_msg = USER_PROMPT_TEMPLATE.format(
+            section_count=section_count,
+            delimiter_count=section_count - 1,
+            delimiter=SECTION_DELIMITER,
+            chapter_text=chapter_text,
         )
 
         messages = [
-            {"role": "system", "content": system_msg},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ]
 

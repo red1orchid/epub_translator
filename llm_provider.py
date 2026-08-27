@@ -1,7 +1,7 @@
 import abc
 from typing import List, Dict
 
-__all__ = ["LLMProvider", "OpenAIProvider", "AnthropicProvider", "DebugProvider", "create_provider"]
+__all__ = ["LLMProvider", "OpenAIProvider", "AnthropicProvider", "create_provider"]
 
 
 class LLMProvider(abc.ABC):
@@ -59,30 +59,7 @@ class AnthropicProvider(LLMProvider):
         return text
 
 
-class DebugProvider(LLMProvider):
-    def __init__(self, model: str):
-        self.model = model
-        self.last_request = None
-
-    def chat(self, messages: List[Dict[str, str]]) -> str:
-        self.last_request = {
-            "model": self.model,
-            "messages": messages,
-        }
-        # Return dummy response with the same number of sections as the input.
-        # The prompt states the count explicitly ("exactly N sections"); counting
-        # raw delimiters would overcount because the instructions mention '⟪§⟫' too.
-        import re
-        user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
-        match = re.search(r"exactly (\d+) sections", user_content)
-        section_count = int(match.group(1)) if match else user_content.count("⟪§⟫") + 1
-        return "⟪§⟫".join([f"[DEBUG TRANSLATION {i+1}]" for i in range(section_count)])
-
-
-def create_provider(provider_name: str, api_key: str, model: str, debug: bool = False) -> LLMProvider:
-    if debug:
-        return DebugProvider(model=model)
-    
+def create_provider(provider_name: str, api_key: str, model: str) -> LLMProvider:
     if provider_name == "openai":
         return OpenAIProvider(api_key=api_key, model=model)
     elif provider_name == "anthropic":
