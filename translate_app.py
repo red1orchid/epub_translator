@@ -13,7 +13,7 @@ from ebooklib import epub
 import ebooklib
 from bs4 import BeautifulSoup
 
-from chapter_translator import ChapterTranslator, PROMPT_VERSION, SECTION_DELIMITER
+from chapter_translator import ChapterTranslator, PROMPT_VERSION, parse_batch_response
 from llm_cache import CachedLLMProvider, LLMResponseCache, estimate_tokens, format_tokens
 from llm_provider import create_provider
 from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_options
@@ -21,7 +21,7 @@ from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_opt
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.8.4"
+APP_VERSION = "1.9.1"
 
 # --- Session state ---
 for _key, _default in [
@@ -221,9 +221,9 @@ def _build_error_report(chapter_num, exc_traceback, request_keys):
             continue
         user_msg = next((m["content"] for m in entry["messages"] if m["role"] == "user"), "")
         expected = _expected_sections(user_msg) or "?"
-        got = entry["response"].count(SECTION_DELIMITER) + 1
+        got = len(parse_batch_response(entry["response"]))
         lines += [
-            f"=== Batch {bi + 1} — LLM RESPONSE (expected {expected} sections, got {got}) ===",
+            f"=== Batch {bi + 1} — LLM RESPONSE (expected {expected} sections, {got} parseable) ===",
             entry["response"],
             "",
             f"=== Batch {bi + 1} — REQUEST (user message) ===",
@@ -475,6 +475,10 @@ if start_button:
                 progress_bar.progress(min(pct, 100))
         translator.on_batch_progress = _on_batch
 
+        def _on_heal(msg, _idx=i):
+            _status(f"Chapter {_idx + 1} · 🩹 self-healing: {msg}")
+        translator.on_heal = _on_heal
+
         try:
             cached = _load_cached(file_hash, i, provider_name, model)
             if cached:
@@ -603,8 +607,8 @@ if _debuggable:
     st.subheader("🔧 Fix failed chapters")
     st.caption(
         "These chapters got LLM responses, but assembling the translation failed. "
-        "Inspect each batch below, fix the response (usually a missing/extra "
-        f"'{SECTION_DELIMITER}' delimiter), press **Save**, then run **Start translation** "
+        "Inspect each batch below, fix the response (it must be a JSON object whose "
+        "keys match the request), press **Save**, then run **Start translation** "
         "again — saved batches are replayed from cache without calling the LLM."
     )
     for _i, _keys in _debuggable:
@@ -625,11 +629,11 @@ if _debuggable:
                     continue
                 _user_msg = next((m["content"] for m in _entry["messages"] if m["role"] == "user"), "")
                 _expected = _expected_sections(_user_msg)
-                _got = _entry["response"].count(SECTION_DELIMITER) + 1
+                _got = len(parse_batch_response(_entry["response"]))
                 _ok = _expected == _got
                 st.markdown(
                     f"**Batch {_bi + 1}** — expected **{_expected}** sections, "
-                    f"response has **{_got}** {'✅' if _ok else '❌ (fix the delimiters below)'}"
+                    f"response has **{_got}** parseable {'✅' if _ok else '❌ (fix the JSON below)'}"
                 )
                 _edited = st.text_area(
                     f"Response for batch {_bi + 1}",

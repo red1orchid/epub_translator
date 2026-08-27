@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 from typing import List
 
@@ -54,45 +55,101 @@ SYSTEM_PROMPT = (
     "konnte.' (two sentences of natural length, one Nebensatz each, no "
     "participle attribute, no Konjunktiv I)\n"
     "\n"
-    "Output ONLY the German translation. No notes, no explanations, no added text."
+    "Output ONLY the German translation, in the exact format the task asks for. "
+    "No notes, no explanations, no added text."
 )
 
 # The literal "exactly {section_count} sections" phrasing is parsed back out of
 # the request by the app (to show expected/actual counts) — keep it intact.
 USER_PROMPT_TEMPLATE = (
-    "Translate the following text into German at CEFR level B1 (never above B1).\n"
-    "It contains exactly {section_count} sections separated by '{delimiter}'.\n"
+    "Translate the values of this JSON object into German at CEFR level B1 "
+    "(never above B1).\n"
+    "It contains exactly {section_count} sections, with keys \"1\" to "
+    "\"{section_count}\".\n"
     "RULES:\n"
-    "- Preserve every '{delimiter}' exactly as-is. Output must have exactly "
-    "{delimiter_count} delimiters ({section_count} sections). "
-    "Do not merge or drop any section.\n"
-    "- Inside a section you may split a long sentence into shorter ones. "
-    "That does not change the number of sections.\n"
-    "- Check every sentence before you answer: longer than 20 words, more than one "
-    "Nebensatz, or a word a B1 learner would not know? Rewrite it simpler.\n"
+    "- The sections are paragraphs of one book chapter, in reading order. Use "
+    "the neighboring sections as context — who is speaking, what pronouns refer "
+    "to, recurring names and terms — but keep each translation strictly under "
+    "its own key.\n"
+    "- Answer with ONE valid JSON object with exactly the same keys. Each value "
+    "must be the German translation of the input value with the same key.\n"
+    "- Never merge or skip sections: the value for key \"7\" is the translation "
+    "of input \"7\" and nothing else. Keep every key, even for very short "
+    "sections.\n"
+    "- Inside a value you may split a long sentence into shorter ones.\n"
+    "- Check every sentence: longer than 20 words, more than one Nebensatz, or "
+    "a word a B1 learner would not know? Rewrite it simpler.\n"
     "\n"
-    "{chapter_text}\n"
+    "{sections_json}\n"
     "\n"
-    "[REMINDER: {section_count} sections, {delimiter_count} delimiters "
-    "('{delimiter}'). German at B1, never above: sentences under 20 words, common "
-    "words, no Nominalstil, no participial attributes. No added text.]"
+    "[REMINDER: answer with ONE JSON object, keys \"1\" to \"{section_count}\", "
+    "values = German at B1 (sentences under 20 words, common words, no "
+    "Nominalstil, no participial attributes). No text outside the JSON.]"
 )
 
-# Editing either prompt above changes this automatically, which invalidates the
+# Fallback for self-healing: one section per call. A single-text request has no
+# structure the model could break, so it can never miscount. The neighboring
+# paragraphs are passed as context so pronouns/speakers still resolve correctly.
+SINGLE_PROMPT_TEMPLATE = (
+    "Translate the TRANSLATE text into German at CEFR level B1 (never above "
+    "B1).\n"
+    "CONTEXT BEFORE and CONTEXT AFTER are the surrounding paragraphs of the "
+    "same book chapter. Use them to resolve pronouns, speakers and recurring "
+    "terms — but translate ONLY the TRANSLATE text.\n"
+    "Answer with ONLY the translation. No labels, no notes.\n"
+    "\n"
+    "CONTEXT BEFORE: {before}\n"
+    "\n"
+    "TRANSLATE: {text}\n"
+    "\n"
+    "CONTEXT AFTER: {after}"
+)
+
+# Editing any prompt above changes this automatically, which invalidates the
 # on-disk caches — otherwise chapters translated with an older prompt would keep
 # being served from cache and the new instructions would appear to do nothing.
 PROMPT_VERSION = hashlib.sha256(
-    (SYSTEM_PROMPT + USER_PROMPT_TEMPLATE).encode("utf-8")
+    (SYSTEM_PROMPT + USER_PROMPT_TEMPLATE + SINGLE_PROMPT_TEMPLATE).encode("utf-8")
 ).hexdigest()[:8]
 
 
+def parse_batch_response(response: str) -> dict:
+    """Best-effort parse of a batch answer into {key: german_text}.
+
+    Handles code fences and text around the JSON. If the JSON itself is broken
+    (e.g. truncated mid-string), salvages every complete "key": "value" pair —
+    the healing loop retranslates whatever could not be recovered.
+    """
+    text = response.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict):
+                return {str(k): v for k, v in data.items() if isinstance(v, str)}
+        except json.JSONDecodeError:
+            pass
+    salvaged = {}
+    for m in re.finditer(r'"(\d+)"\s*:\s*"((?:[^"\\]|\\.)*)"', text):
+        try:
+            salvaged[m.group(1)] = json.loads(f'"{m.group(2)}"')
+        except json.JSONDecodeError:
+            continue
+    return salvaged
+
+
 class ChapterTranslator:
-    def __init__(self, provider: LLMProvider, max_tokens: int = 100000, on_response=None, on_batch_progress=None):
+    def __init__(self, provider: LLMProvider, max_tokens: int = 100000, on_response=None,
+                 on_batch_progress=None, on_heal=None):
         self.provider = provider
         self.max_tokens = max_tokens
         self._raw_responses: List[str] = []
         self.on_response = on_response
         self.on_batch_progress = on_batch_progress
+        self.on_heal = on_heal  # called with a short message when self-healing kicks in
 
     def translate(self, chapter: EpubHtml):
         """Translate chapter in-place. Returns (raw_sections, translated_sections)."""
@@ -194,21 +251,61 @@ class ChapterTranslator:
         return translated_sections
 
     def _translate_batch(self, sections: List[str]) -> List[str]:
-        """Send sections as flowing text separated by delimiters, parse back."""
-        chapter_text = f"\n{SECTION_DELIMITER}\n".join(sections)
-        response = self._call_llm(chapter_text, len(sections))
+        """Translate sections as a keyed JSON object, healing automatically.
 
-        # Split response by delimiter
-        parts = re.split(r'\s*' + re.escape(SECTION_DELIMITER) + r'\s*', response.strip())
+        Ladder: whole batch -> one retry with only the missing sections ->
+        one call per still-missing section (which cannot miscount). The batch
+        therefore always completes; nothing depends on the model keeping a
+        fragile global count.
+        """
+        remaining = list(enumerate(sections))  # (original_index, text)
+        results = {}
 
-        if len(parts) != len(sections):
-            raise Exception(
-                f"Section count mismatch after translation. "
-                f"Expected {len(sections)}, got {len(parts)}.\n"
-                f"Raw response:\n{response}"
-            )
+        for attempt in (1, 2):
+            if not remaining:
+                break
+            payload = {str(j + 1): text for j, (_, text) in enumerate(remaining)}
+            response = self._call_llm(self._batch_prompt(payload))
+            parsed = parse_batch_response(response)
 
-        return [p.strip() for p in parts]
+            still_missing = []
+            for j, (orig_idx, text) in enumerate(remaining):
+                value = parsed.get(str(j + 1), "")
+                if isinstance(value, str) and value.strip():
+                    results[orig_idx] = value.strip()
+                else:
+                    still_missing.append((orig_idx, text))
+
+            if still_missing and attempt == 1:
+                if len(still_missing) == len(remaining):
+                    # Nothing parsed: an identical retry would be answered from
+                    # the response cache with the same bad reply — go one-by-one
+                    self._heal(f"response unusable ({len(remaining)} sections) — translating one by one")
+                    break
+                self._heal(f"{len(still_missing)}/{len(remaining)} sections missing — retrying them as a smaller batch")
+            elif still_missing:
+                self._heal(f"{len(still_missing)} section(s) still missing — translating one by one")
+            remaining = still_missing
+
+        for orig_idx, text in remaining:
+            before = sections[orig_idx - 1][-300:] if orig_idx > 0 else "(none)"
+            after = sections[orig_idx + 1][:300] if orig_idx + 1 < len(sections) else "(none)"
+            results[orig_idx] = self._call_llm(
+                SINGLE_PROMPT_TEMPLATE.format(before=before, text=text, after=after)
+            ).strip()
+
+        return [results[i] for i in range(len(sections))]
+
+    def _heal(self, message: str):
+        if self.on_heal:
+            self.on_heal(message)
+
+    @staticmethod
+    def _batch_prompt(payload: dict) -> str:
+        return USER_PROMPT_TEMPLATE.format(
+            section_count=len(payload),
+            sections_json=json.dumps(payload, ensure_ascii=False, indent=1),
+        )
 
     def _make_batches(self, raw_sections: List[str]) -> List[List[str]]:
         """Split sections into batches that fit within token limits."""
@@ -225,14 +322,7 @@ class ChapterTranslator:
 
         return batches
 
-    def _call_llm(self, chapter_text: str, section_count: int) -> str:
-        user_msg = USER_PROMPT_TEMPLATE.format(
-            section_count=section_count,
-            delimiter_count=section_count - 1,
-            delimiter=SECTION_DELIMITER,
-            chapter_text=chapter_text,
-        )
-
+    def _call_llm(self, user_msg: str) -> str:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
