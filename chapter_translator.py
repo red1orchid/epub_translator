@@ -10,6 +10,12 @@ from llm_provider import LLMProvider
 
 SECTION_DELIMITER = "⟪§⟫"
 
+BLOCK_TAGS = ["p", "li", "h1", "h2", "h3", "h4", "blockquote"]
+
+# Bump when extraction/assembly changes shape (not just the prompt wording):
+# cached raw/translated lists from an older pipeline would misalign otherwise.
+PIPELINE_VERSION = "2"
+
 SYSTEM_PROMPT = (
     "You translate books into simple German for adult learners at CEFR level "
     "B1. B1 is a hard ceiling: never write a sentence that a B1 learner "
@@ -109,7 +115,7 @@ SINGLE_PROMPT_TEMPLATE = (
 # on-disk caches — otherwise chapters translated with an older prompt would keep
 # being served from cache and the new instructions would appear to do nothing.
 PROMPT_VERSION = hashlib.sha256(
-    (SYSTEM_PROMPT + USER_PROMPT_TEMPLATE + SINGLE_PROMPT_TEMPLATE).encode("utf-8")
+    (PIPELINE_VERSION + SYSTEM_PROMPT + USER_PROMPT_TEMPLATE + SINGLE_PROMPT_TEMPLATE).encode("utf-8")
 ).hexdigest()[:8]
 
 
@@ -151,17 +157,23 @@ class ChapterTranslator:
         self.on_batch_progress = on_batch_progress
         self.on_heal = on_heal  # called with a short message when self-healing kicks in
 
+    @staticmethod
+    def extract_blocks(soup):
+        """Outermost text blocks only. A <p> inside a <blockquote> (or a nested
+        <li>) must not become its own section: the parent block already contains
+        its text, and parent/child pairs put duplicate sections into the LLM
+        request and collide when the translations are applied back."""
+        return [
+            tag for tag in soup.find_all(BLOCK_TAGS)
+            if tag.find_parent(BLOCK_TAGS) is None
+        ]
+
     def translate(self, chapter: EpubHtml):
         """Translate chapter in-place. Returns (raw_sections, translated_sections)."""
         self._raw_responses = []
         soup = BeautifulSoup(chapter.content, "html.parser")
-        formatted_sections = []
-        raw_sections = []
-
-        blocks = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
-        for tag in blocks:
-            formatted_sections.append(tag)
-            raw_sections.append(tag.get_text(strip=True))
+        formatted_sections = self.extract_blocks(soup)
+        raw_sections = [tag.get_text(strip=True) for tag in formatted_sections]
 
         translated_sections = self._translate_chapter(raw_sections)
 
@@ -177,7 +189,7 @@ class ChapterTranslator:
     def apply_cached(self, chapter: EpubHtml, raw_sections: List[str], translated_sections: List[str]):
         """Apply previously cached translations to a chapter without calling LLM."""
         soup = BeautifulSoup(chapter.content, "html.parser")
-        formatted_sections = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
+        formatted_sections = self.extract_blocks(soup)
         self._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
         chapter.content = str(soup).encode("utf-8")
 

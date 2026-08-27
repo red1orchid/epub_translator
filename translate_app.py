@@ -21,7 +21,7 @@ from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_opt
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 
 # --- Session state ---
 for _key, _default in [
@@ -393,7 +393,7 @@ if preview_button:
     preview_chapter = chapters[first_idx]
 
     soup = BeautifulSoup(preview_chapter.get_content(), "html.parser")
-    blocks = soup.find_all(["p", "li", "blockquote"])
+    blocks = ChapterTranslator.extract_blocks(soup)
     raw_sections = [tag.get_text(strip=True) for tag in blocks if tag.get_text(strip=True)]
     preview_sections = raw_sections[:PREVIEW_SECTIONS]
 
@@ -488,9 +488,8 @@ if start_button:
             else:
                 _status(f"Chapter {i + 1} · extracting text")
                 soup = BeautifulSoup(chapter.content, "html.parser")
-                raw_sections = []
-                for tag in soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"]):
-                    raw_sections.append(tag.get_text(strip=True))
+                formatted_sections = ChapterTranslator.extract_blocks(soup)
+                raw_sections = [tag.get_text(strip=True) for tag in formatted_sections]
 
                 # Calculate batches for this chapter to update total
                 _batches = translator._make_batches(raw_sections)
@@ -508,7 +507,6 @@ if start_button:
 
                 # Now apply to soup (this might fail, but cache is already saved)
                 _status(f"Chapter {i + 1} · applying translation to chapter HTML")
-                formatted_sections = soup.find_all(["p", "li", "h1", "h2", "h3", "h4", "blockquote"])
                 translator._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
                 chapter.content = str(soup).encode("utf-8")
                 _status(f"Chapter {i + 1} · done")
