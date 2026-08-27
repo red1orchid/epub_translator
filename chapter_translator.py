@@ -126,6 +126,11 @@ class ChapterTranslator:
 
     def _apply_to_soup(self, soup, formatted_sections, translated_sections, raw_sections):
         for tag, new_text, original_text in zip(formatted_sections, translated_sections, raw_sections):
+            # Blocks with no text (spacers, image-only paragraphs, pure anchors)
+            # have nothing to translate: leave them untouched — clearing them
+            # would destroy images, and '[<empty>]' would render as stray '[]'
+            if not original_text.strip():
+                continue
             # For links only replace link name, preserve href
             if tag.name == "li" and tag.find("a"):
                 a_tag = tag.find("a")
@@ -161,19 +166,31 @@ class ChapterTranslator:
         if not raw_sections:
             return []
 
-        batches = self._make_batches(raw_sections)
-        translated_sections = []
+        # Empty sections must not enter the LLM protocol: consecutive delimiters
+        # with nothing between them (or a trailing delimiter after an empty last
+        # section) make the model merge or drop delimiters and break the count.
+        # Translate only non-empty sections and stitch the empties back after.
+        non_empty_indices = [i for i, s in enumerate(raw_sections) if s.strip()]
+        to_translate = [raw_sections[i] for i in non_empty_indices]
+        if not to_translate:
+            return [""] * len(raw_sections)
+
+        batches = self._make_batches(to_translate)
+        translated = []
         for batch_idx, batch in enumerate(batches):
-            translated_sections.extend(self._translate_batch(batch))
+            translated.extend(self._translate_batch(batch))
             if self.on_batch_progress:
                 self.on_batch_progress(batch_idx + 1, len(batches))
 
-        if len(translated_sections) != len(raw_sections):
+        if len(translated) != len(to_translate):
             raise Exception(
                 f"Translated sections count mismatch. "
-                f"Expected {len(raw_sections)}, got {len(translated_sections)}."
+                f"Expected {len(to_translate)}, got {len(translated)}."
             )
 
+        translated_sections = [""] * len(raw_sections)
+        for idx, text in zip(non_empty_indices, translated):
+            translated_sections[idx] = text
         return translated_sections
 
     def _translate_batch(self, sections: List[str]) -> List[str]:
