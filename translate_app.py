@@ -21,7 +21,7 @@ from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_opt
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.3"
 
 # --- Session state ---
 for _key, _default in [
