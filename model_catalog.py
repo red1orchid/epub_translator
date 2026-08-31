@@ -70,19 +70,17 @@ def get_model_options(
     provider_name: str,
     live_prices: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> List[dict]:
-    """Model options for a provider: [{id, label, live}], label includes prices."""
+    """Model options for a provider: [{id, label}], label includes prices."""
     options = []
     for model_id, fallback_in, fallback_out in MODELS.get(provider_name, []):
-        price_in, price_out, is_live = fallback_in, fallback_out, False
+        price_in, price_out = fallback_in, fallback_out
         if live_prices:
             for key in (model_id, f"{provider_name}/{model_id}"):
                 if key in live_prices:
                     price_in, price_out = live_prices[key]
-                    is_live = True
                     break
         options.append({
             "id": model_id,
             "label": f"{model_id} · {_fmt_price(price_in)} in / {_fmt_price(price_out)} out per 1M tokens",
-            "live": is_live,
         })
     return options

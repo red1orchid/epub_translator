@@ -4,6 +4,7 @@ import tempfile
 import base64
 import hashlib
 import json
+import threading
 import time
 import traceback
 
@@ -21,20 +22,28 @@ from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_opt
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.10.0"
 
 # --- Session state ---
-for _key, _default in [
-    ("translation_cache", {}),
-    ("output_epub_bytes", None),
-    ("output_filename", None),
-]:
-    if _key not in st.session_state:
-        st.session_state[_key] = _default
+if "auto_downloaded_jobs" not in st.session_state:
+    st.session_state.auto_downloaded_jobs = set()
 
 # --- Disk cache (survives full session loss / page reload on mobile) ---
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "epub_translator_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
 def _chapter_key(file_hash, chapter_idx, prov, mdl):
@@ -45,78 +54,236 @@ def _chapter_key(file_hash, chapter_idx, prov, mdl):
     ).hexdigest()[:16]
 
 
-def _disk_cache_path(file_hash, chapter_idx, prov, mdl):
-    return os.path.join(CACHE_DIR, f"{_chapter_key(file_hash, chapter_idx, prov, mdl)}.json")
+def _chapter_path(file_hash, chapter_idx, prov, mdl, suffix=".json"):
+    return os.path.join(CACHE_DIR, _chapter_key(file_hash, chapter_idx, prov, mdl) + suffix)
 
 
 def _load_cached(file_hash, chapter_idx, prov, mdl):
-    p = _disk_cache_path(file_hash, chapter_idx, prov, mdl)
-    if os.path.exists(p):
-        try:
-            with open(p) as f:
-                data = json.load(f)
-            return data["raw"], data["translated"]
-        except Exception:
-            return None
-    return None
+    data = _read_json(_chapter_path(file_hash, chapter_idx, prov, mdl))
+    return (data["raw"], data["translated"]) if data else None
 
 
 def _save_cached(file_hash, chapter_idx, prov, mdl, raw, translated):
-    p = _disk_cache_path(file_hash, chapter_idx, prov, mdl)
-    with open(p, "w") as f:
-        json.dump({"raw": raw, "translated": translated}, f, ensure_ascii=False)
-
-
-def _request_keys_path(file_hash, chapter_idx, prov, mdl):
-    """Path of the file listing LLM response-cache keys used by a chapter."""
-    return os.path.join(
-        CACHE_DIR, f"{_chapter_key(file_hash, chapter_idx, prov, mdl)}_requests.json"
-    )
+    _write_json(_chapter_path(file_hash, chapter_idx, prov, mdl),
+                {"raw": raw, "translated": translated})
 
 
 def _save_request_keys(file_hash, chapter_idx, prov, mdl, keys):
-    with open(_request_keys_path(file_hash, chapter_idx, prov, mdl), "w") as f:
-        json.dump(keys, f)
+    """List of LLM response-cache keys used by a chapter."""
+    _write_json(_chapter_path(file_hash, chapter_idx, prov, mdl, "_requests.json"), keys)
 
 
 def _load_request_keys(file_hash, chapter_idx, prov, mdl):
-    p = _request_keys_path(file_hash, chapter_idx, prov, mdl)
-    if os.path.exists(p):
-        try:
-            with open(p) as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-
-def _error_report_path(file_hash, chapter_idx, prov, mdl):
-    return os.path.join(
-        CACHE_DIR, f"{_chapter_key(file_hash, chapter_idx, prov, mdl)}_error.txt"
-    )
+    return _read_json(_chapter_path(file_hash, chapter_idx, prov, mdl, "_requests.json"))
 
 
 def _save_error_report(file_hash, chapter_idx, prov, mdl, text):
-    with open(_error_report_path(file_hash, chapter_idx, prov, mdl), "w") as f:
+    with open(_chapter_path(file_hash, chapter_idx, prov, mdl, "_error.txt"), "w") as f:
         f.write(text)
 
 
 def _load_error_report(file_hash, chapter_idx, prov, mdl):
-    p = _error_report_path(file_hash, chapter_idx, prov, mdl)
-    if os.path.exists(p):
-        try:
-            with open(p) as f:
-                return f.read()
-        except Exception:
-            return None
-    return None
+    try:
+        with open(_chapter_path(file_hash, chapter_idx, prov, mdl, "_error.txt")) as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 def _clear_error_report(file_hash, chapter_idx, prov, mdl):
     try:
-        os.remove(_error_report_path(file_hash, chapter_idx, prov, mdl))
+        os.remove(_chapter_path(file_hash, chapter_idx, prov, mdl, "_error.txt"))
     except FileNotFoundError:
         pass
+
+
+def _expected_sections(user_msg):
+    """Section count a batch request asked for (stated explicitly in the prompt)."""
+    match = re.search(r"exactly (\d+) sections", user_msg)
+    return int(match.group(1)) if match else None
+
+
+def _build_error_report(chapter_num, exc_traceback, request_keys, prov, mdl, cache):
+    """Plain-text debug report: full traceback plus each batch's request/response."""
+    lines = [
+        f"EPUB Translator v{APP_VERSION} — error report",
+        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Provider / model: {prov} / {mdl}",
+        f"Chapter: {chapter_num}",
+        "",
+        "=== Exception (full traceback) ===",
+        exc_traceback.rstrip(),
+        "",
+    ]
+    for bi, key in enumerate(request_keys or []):
+        entry = cache.load(key)
+        if entry is None:
+            lines.append(f"=== Batch {bi + 1}: no cached response (LLM call never completed) ===")
+            lines.append("")
+            continue
+        user_msg = next((m["content"] for m in entry["messages"] if m["role"] == "user"), "")
+        expected = _expected_sections(user_msg) or "?"
+        got = len(parse_batch_response(entry["response"]))
+        lines += [
+            f"=== Batch {bi + 1} — LLM RESPONSE (expected {expected} sections, {got} parseable) ===",
+            entry["response"],
+            "",
+            f"=== Batch {bi + 1} — REQUEST (user message) ===",
+            user_msg,
+            "",
+        ]
+    return "\n".join(lines)
+
+
+# ebooklib 0.20 parses the TOC from nav.xhtml with uid=None on every link;
+# writing the NCX then crashes on those (navPoint id must be a string).
+# Assign uids so books shipping both nav.xhtml and toc.ncx can be rebuilt.
+def _ensure_toc_uids(entries, _counter=None):
+    if _counter is None:
+        _counter = [0]
+    for entry in entries:
+        if isinstance(entry, (tuple, list)):
+            _ensure_toc_uids(entry[1], _counter)
+        else:
+            _counter[0] += 1
+            if getattr(entry, "uid", None) in (None, ""):
+                entry.uid = f"navpoint-{_counter[0]}"
+
+
+def _translatable_chapters(book):
+    """Document items minus navigation documents. Deterministic — the UI and
+    the background worker must agree on chapter indices."""
+    all_items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+    nav_item_names = set()
+    for item in all_items:
+        try:
+            content = item.get_content().decode("utf-8", errors="ignore")
+            soup = BeautifulSoup(content, "html.parser")
+            if soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", id="toc"):
+                nav_item_names.add(item.get_name())
+        except Exception:
+            pass
+    for item in all_items:
+        name = item.get_name().lower()
+        if "nav" in name or "toc" in name:
+            nav_item_names.add(item.get_name())
+    return [item for item in all_items if item.get_name() not in nav_item_names]
+
+
+# --- Background translation jobs -------------------------------------------
+# The translation runs in a server-side daemon thread and communicates only
+# through files in CACHE_DIR, so it survives the browser tab being suspended
+# (mobile), page reloads, and even full session loss. One job per book+model.
+
+def _job_key(file_hash, prov, mdl):
+    return hashlib.sha256(f"job:{file_hash}:{prov}:{mdl}:{PROMPT_VERSION}".encode()).hexdigest()[:16]
+
+
+def _job_state_path(job_key):
+    return os.path.join(CACHE_DIR, f"{job_key}_job.json")
+
+
+def _job_input_path(job_key):
+    return os.path.join(CACHE_DIR, f"{job_key}_input.epub")
+
+
+def _job_output_path(job_key):
+    return os.path.join(CACHE_DIR, f"{job_key}_output.epub")
+
+
+def _read_job_state(job_key):
+    return _read_json(_job_state_path(job_key))
+
+
+def _write_job_state(job_key, state):
+    # Written atomically so a concurrent poll never reads a half-written file
+    tmp = _job_state_path(job_key) + ".tmp"
+    _write_json(tmp, state)
+    os.replace(tmp, _job_state_path(job_key))
+
+
+def _run_translation_job(job_key, input_path, output_path, selected_indices,
+                         prov_name, mdl, api_key, book_hash, state):
+    """Background worker. Runs in a daemon thread: NO streamlit calls in here —
+    all progress goes through the job state file. `state` is the initial job
+    state the UI already wrote before starting the thread."""
+
+    def flush():
+        state["heartbeat"] = time.time()
+        _write_job_state(job_key, state)
+
+    try:
+        cache = LLMResponseCache(CACHE_DIR, namespace=f"{prov_name}:{mdl}:{PROMPT_VERSION}")
+        provider = CachedLLMProvider(create_provider(prov_name, api_key=api_key, model=mdl), cache=cache)
+        translator = ChapterTranslator(provider=provider, max_tokens=4000)
+
+        book = epub.read_epub(input_path)
+        _ensure_toc_uids(book.toc)
+        chapters = _translatable_chapters(book)
+
+        for pos, i in enumerate(selected_indices, start=1):
+            chapter = chapters[i]
+            head = f"Chapter {pos}/{len(selected_indices)}"
+            _nb, _done, _keys = [0], [0], []
+
+            def _on_event(kind, key, tokens, keys=_keys, nb=_nb, done=_done, head=head, idx=i):
+                if key not in keys:
+                    keys.append(key)
+                    _save_request_keys(book_hash, idx, prov_name, mdl, keys)
+                batch = f"batch {done[0] + 1}/{max(nb[0], 1)}"
+                if kind == "llm_call":
+                    state["message"] = f"{head} · {batch} · LLM call {format_tokens(tokens)}"
+                    flush()
+                elif kind == "cache_hit":
+                    state["message"] = f"{head} · {batch} · cached response ({format_tokens(tokens)}, free)"
+                    flush()
+            provider.on_event = _on_event
+
+            def _on_batch(current, total, done=_done, nb=_nb):
+                done[0] = current
+                nb[0] = total
+            translator.on_batch_progress = _on_batch
+
+            def _on_heal(msg, head=head):
+                state["message"] = f"{head} · self-healing: {msg}"
+                flush()
+            translator.on_heal = _on_heal
+
+            try:
+                cached = _load_cached(book_hash, i, prov_name, mdl)
+                if cached:
+                    state["message"] = f"{head} · from cache (free)"
+                    flush()
+                    raw_sections, translated_sections = cached
+                    translator.apply_cached(chapter, raw_sections, translated_sections)
+                else:
+                    raw_sections, translated_sections = translator.translate(chapter)
+                    _save_cached(book_hash, i, prov_name, mdl, raw_sections, translated_sections)
+
+                state["translated"] += 1
+                _clear_error_report(book_hash, i, prov_name, mdl)
+            except Exception as exc:
+                tb = traceback.format_exc()
+                _save_error_report(book_hash, i, prov_name, mdl,
+                                   _build_error_report(i + 1, tb, _keys, prov_name, mdl, cache))
+                state["failed"].append({"chapter": i + 1, "error": str(exc)})
+            flush()
+
+        if state["translated"]:
+            state["message"] = "Building EPUB ..."
+            flush()
+            tmp = output_path + ".tmp"
+            epub.write_epub(tmp, book, {"plugins": []})
+            os.replace(tmp, output_path)
+            state["status"] = "done"
+            state["message"] = "finished"
+        else:
+            state["status"] = "error"
+            state["error"] = "No chapters were translated — see 'Fix failed chapters' below."
+    except Exception:
+        state["status"] = "error"
+        state["error"] = traceback.format_exc()
+    flush()
 
 
 def _auto_download(data: bytes, filename: str, mime: str):
@@ -194,46 +361,8 @@ provider = CachedLLMProvider(
 translator = ChapterTranslator(provider=provider, max_tokens=4000)
 
 
-def _expected_sections(user_msg):
-    """Section count a batch request asked for. The prompt states it explicitly;
-    counting delimiters would overcount (the instructions mention the delimiter too)."""
-    match = re.search(r"exactly (\d+) sections", user_msg)
-    return int(match.group(1)) if match else None
-
-
-def _build_error_report(chapter_num, exc_traceback, request_keys):
-    """Plain-text debug report: full traceback plus each batch's request/response."""
-    lines = [
-        f"EPUB Translator v{APP_VERSION} — error report",
-        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Provider / model: {provider_name} / {model}",
-        f"Chapter: {chapter_num}",
-        "",
-        "=== Exception (full traceback) ===",
-        exc_traceback.rstrip(),
-        "",
-    ]
-    for bi, key in enumerate(request_keys or []):
-        entry = response_cache.load(key)
-        if entry is None:
-            lines.append(f"=== Batch {bi + 1}: no cached response (LLM call never completed) ===")
-            lines.append("")
-            continue
-        user_msg = next((m["content"] for m in entry["messages"] if m["role"] == "user"), "")
-        expected = _expected_sections(user_msg) or "?"
-        got = len(parse_batch_response(entry["response"]))
-        lines += [
-            f"=== Batch {bi + 1} — LLM RESPONSE (expected {expected} sections, {got} parseable) ===",
-            entry["response"],
-            "",
-            f"=== Batch {bi + 1} — REQUEST (user message) ===",
-            user_msg,
-            "",
-        ]
-    return "\n".join(lines)
-
 def _get_chapter_label(idx: int, chapter_item) -> str:
-    """Return a human-readable label: 'Chapter N: <heading or first line>'."""
+    """Chapter's own heading when it has one; 'Chapter N' framing only as fallback."""
     try:
         content = chapter_item.get_content().decode("utf-8", errors="ignore")
         soup = BeautifulSoup(content, "html.parser")
@@ -241,7 +370,7 @@ def _get_chapter_label(idx: int, chapter_item) -> str:
         if heading:
             text = heading.get_text(strip=True)
             if text:
-                return f"Chapter {idx + 1}: {text[:80]}"
+                return text[:80]
         first_p = soup.find("p")
         if first_p:
             text = first_p.get_text(strip=True)
@@ -249,7 +378,7 @@ def _get_chapter_label(idx: int, chapter_item) -> str:
                 return f"Chapter {idx + 1}: {text[:80]}"
     except Exception:
         pass
-    return f"Chapter {idx + 1}: ({chapter_item.get_name()})"
+    return f"Chapter {idx + 1} ({chapter_item.get_name()})"
 
 # --- File upload ---
 uploaded = st.file_uploader("Choose an EPUB file")
@@ -257,31 +386,6 @@ uploaded = st.file_uploader("Choose an EPUB file")
 if uploaded is None:
     st.info("Upload an EPUB to begin.")
     st.stop()
-
-# Validate that the uploaded file is actually an EPUB (EPUBs are ZIP files)
-import zipfile
-try:
-    # Check if it's a valid ZIP file
-    with zipfile.ZipFile(uploaded, 'r') as zip_ref:
-        # EPUB must contain mimetype file at the start
-        namelist = zip_ref.namelist()
-        if 'mimetype' not in namelist:
-            st.error("Invalid EPUB file: missing mimetype")
-            st.stop()
-        # Check mimetype content
-        mimetype_content = zip_ref.read('mimetype').decode('utf-8')
-        if mimetype_content != 'application/epub+zip':
-            st.error("Invalid EPUB file: incorrect mimetype")
-            st.stop()
-except zipfile.BadZipFile:
-    st.error("Invalid EPUB file: not a valid ZIP archive")
-    st.stop()
-except Exception as e:
-    st.error(f"Error validating EPUB file: {e}")
-    st.stop()
-
-# Reset file pointer after reading
-uploaded.seek(0)
 
 # Compute file hash for cache keying
 file_hash = hashlib.md5(uploaded.getvalue()).hexdigest()
@@ -294,71 +398,37 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tf:
     tf.write(uploaded.getvalue())
     temp_input_path = tf.name
 
-# load book
-book = epub.read_epub(temp_input_path)
-
-
-# ebooklib 0.20 parses the TOC from nav.xhtml with uid=None on every link;
-# writing the NCX then crashes on those (navPoint id must be a string).
-# Assign uids so books shipping both nav.xhtml and toc.ncx can be rebuilt.
-def _ensure_toc_uids(entries, _counter=None):
-    if _counter is None:
-        _counter = [0]
-    for entry in entries:
-        if isinstance(entry, (tuple, list)):
-            _ensure_toc_uids(entry[1], _counter)
-        else:
-            _counter[0] += 1
-            if getattr(entry, "uid", None) in (None, ""):
-                entry.uid = f"navpoint-{_counter[0]}"
-
-
+# load book (read_epub rejects anything that is not a valid EPUB/ZIP)
+try:
+    book = epub.read_epub(temp_input_path)
+except Exception as e:
+    st.error(f"Could not read the file as an EPUB: {e}")
+    st.stop()
 _ensure_toc_uids(book.toc)
 
-# get chapter/document items, excluding navigation documents
-all_items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
-nav_item_names = set()
-
-# Identify navigation items to skip
-for item in all_items:
-    if getattr(item, 'is_chapter', lambda: False)():
-        continue
-    # Check if item is a nav document by content
-    try:
-        content = item.get_content().decode("utf-8", errors="ignore")
-        soup = BeautifulSoup(content, "html.parser")
-        if soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", id="toc"):
-            nav_item_names.add(item.get_name())
-    except Exception:
-        pass
-
-# Also check by file name patterns common for nav/toc
-for item in all_items:
-    name = item.get_name().lower()
-    if "nav" in name or "toc" in name:
-        nav_item_names.add(item.get_name())
-
-chapters = [item for item in all_items if item.get_name() not in nav_item_names]
+chapters = _translatable_chapters(book)
 n_chapters = len(chapters)
 
 st.write(f"Found **{n_chapters}** translatable chapter(s).")
 
-# --- Chapter multiselect with readable labels ---
-chapter_labels = [_get_chapter_label(i, ch) for i, ch in enumerate(chapters)]
+# --- Chapter multiselect with readable labels (made unique for selection) ---
+chapter_labels = []
+_label_counts = {}
+for _i, _ch in enumerate(chapters):
+    _lbl = _get_chapter_label(_i, _ch)
+    _label_counts[_lbl] = _label_counts.get(_lbl, 0) + 1
+    if _label_counts[_lbl] > 1:
+        _lbl = f"{_lbl} ({_label_counts[_lbl]})"
+    chapter_labels.append(_lbl)
+_label_to_idx = {lbl: i for i, lbl in enumerate(chapter_labels)}
 
 selected_labels = st.multiselect(
     "Select chapters to translate",
     options=chapter_labels,
     default=[],
-    help="Each entry shows the chapter number and its heading or first line.",
+    help="Chapter headings from the book; 'Chapter N' only where a chapter has no heading.",
 )
-
-selected_indices = [chapter_labels.index(lbl) for lbl in selected_labels]
-selected_indices.sort()
-
-if not selected_indices:
-    st.warning("Select at least one chapter.")
-    st.stop()
+selected_indices = sorted(_label_to_idx[lbl] for lbl in selected_labels)
 
 # --- Show cache status ---
 _cached_count = sum(
@@ -375,14 +445,9 @@ with col_start:
 with col_preview:
     preview_button = st.button("Preview translation", use_container_width=True)
 
-# Keep a place for logs/progress
-progress_bar = st.progress(0)
-status = st.empty()
-chapter_status = st.empty()
-log_slot = st.empty()
-
-# We'll store translated book in a temporary file and then offer download
-output_temp_path = None
+if (start_button or preview_button) and not selected_indices:
+    st.warning("Select at least one chapter first.")
+    start_button = preview_button = False
 
 # ========================
 # Preview translation mode
@@ -425,171 +490,93 @@ if preview_button:
 # ========================
 # Full translation mode
 # ========================
+# ========================
+# Full translation mode: runs in a background thread on the server, so it is
+# safe to switch tabs or leave the page (mobile). Progress and the finished
+# EPUB live on disk; the page just polls and auto-downloads when done.
+# ========================
+job_key = _job_key(file_hash, provider_name, model)
+
 if start_button:
-    total_to_translate = len(selected_indices)
-    count = 0
-    all_translations = {}  # {chapter_idx: (raw, translated)}
-    failed_chapters = []
-
-    # Track batches for accurate progress
-    _total_batches_completed = [0]
-    _total_batches = [0]
-    _log_lines = []
-
-    def _status(msg):
-        chapter_status.info(msg)
-        _log_lines.append(msg)
-        log_slot.markdown("\n".join(f"- {l}" for l in _log_lines[-15:]))
-
-    for i in selected_indices:
-        chapter = chapters[i]
-        status.info(f"Translating chapter {i + 1} ({count + 1}/{total_to_translate}) ...")
-
-        # Per-chapter batch tracking (for status messages)
-        _chapter_batches = [0]
-        _chapter_batch_done = [0]
-        _chapter_keys = []
-
-        # LLM cache events: record which cache entries this chapter used
-        # (so failed chapters can be debugged/edited below) and report activity
-        def _on_llm_event(kind, key, tokens, _idx=i, _keys=_chapter_keys,
-                          _nb=_chapter_batches, _done=_chapter_batch_done):
-            if key not in _keys:
-                _keys.append(key)
-                _save_request_keys(file_hash, _idx, provider_name, model, _keys)
-            _batch = f"batch {_done[0] + 1}/{_nb[0]}"
-            if kind == "cache_hit":
-                _status(f"Chapter {_idx + 1} · {_batch} · reusing cached LLM response ({format_tokens(tokens)}, no API cost)")
-            elif kind == "llm_call":
-                _status(f"Chapter {_idx + 1} · {_batch} · LLM call {format_tokens(tokens)} ...")
-            elif kind == "llm_done":
-                _status(f"Chapter {_idx + 1} · {_batch} · response received ({format_tokens(tokens)}), cached to disk")
-        provider.on_event = _on_llm_event
-
-        # Batch progress callback
-        def _on_batch(current, total, _done=_chapter_batch_done):
-            _done[0] = current
-            _total_batches_completed[0] += 1
-            if _total_batches[0] > 0:
-                pct = int((_total_batches_completed[0] / _total_batches[0]) * 100)
-                progress_bar.progress(min(pct, 100))
-        translator.on_batch_progress = _on_batch
-
-        def _on_heal(msg, _idx=i):
-            _status(f"Chapter {_idx + 1} · 🩹 self-healing: {msg}")
-        translator.on_heal = _on_heal
-
-        try:
-            cached = _load_cached(file_hash, i, provider_name, model)
-            if cached:
-                _status(f"Chapter {i + 1} · loading translation from cache (no API cost)")
-                raw_sections, translated_sections = cached
-                translator.apply_cached(chapter, raw_sections, translated_sections)
-            else:
-                _status(f"Chapter {i + 1} · extracting text")
-                soup = BeautifulSoup(chapter.content, "html.parser")
-                formatted_sections = ChapterTranslator.extract_blocks(soup)
-                raw_sections = [tag.get_text(strip=True) for tag in formatted_sections]
-
-                # Calculate batches for this chapter to update total
-                _batches = translator._make_batches(raw_sections)
-                _chapter_batches[0] = len(_batches)
-                _total_batches[0] += len(_batches)
-
-                _status(
-                    f"Chapter {i + 1} · {len(raw_sections)} sections, "
-                    f"{len(_batches)} batch(es), {format_tokens(estimate_tokens(''.join(raw_sections)))} of text"
-                )
-
-                # Translate only (without applying to soup) and cache immediately
-                translated_sections = translator.translate_only(raw_sections)
-                _save_cached(file_hash, i, provider_name, model, raw_sections, translated_sections)
-
-                # Now apply to soup (this might fail, but cache is already saved)
-                _status(f"Chapter {i + 1} · applying translation to chapter HTML")
-                translator._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
-                chapter.content = str(soup).encode("utf-8")
-                _status(f"Chapter {i + 1} · done")
-
-            all_translations[i] = (raw_sections, translated_sections)
-            _clear_error_report(file_hash, i, provider_name, model)
-
-        except Exception as exc:
-            failed_chapters.append(i + 1)
-            _tb = traceback.format_exc()
-            _report = _build_error_report(i + 1, _tb, _chapter_keys)
-            _save_error_report(file_hash, i, provider_name, model, _report)
-
-            st.error(f"Error translating chapter {i + 1}: {exc}")
-            with st.expander(f"Error details — chapter {i + 1}"):
-                st.code(_tb)
-            st.download_button(
-                "⬇️ Download error report (.txt)",
-                data=_report.encode("utf-8"),
-                file_name=f"chapter_{i + 1}_error.txt",
-                mime="text/plain",
-                key=f"err_dl_run_{i}",
-            )
-            # Only mention the response cache if something actually reached it
-            if any(response_cache.load(k) for k in _chapter_keys):
-                st.warning(
-                    f"The raw LLM responses for chapter {i + 1} are cached on disk. "
-                    f"Use **Fix failed chapters** below to inspect/edit them, then press "
-                    f"Start translation again — cached batches are replayed for free."
-                )
-
-        count += 1
-
-    # --- Build EPUB (only if at least one chapter was translated) ---
-    default_out_name = f"{name_root}_de.epub"
-    epub_built = False
-    if all_translations:
-        status.info("Building EPUB ...")
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as out_tf:
-                output_temp_path = out_tf.name
-            epub.write_epub(output_temp_path, book, {"plugins": []})
-            with open(output_temp_path, "rb") as f:
-                out_bytes = f.read()
-            os.remove(output_temp_path)
-
-            st.session_state.output_epub_bytes = out_bytes
-            st.session_state.output_filename = default_out_name
-            epub_built = True
-        except Exception as exc:
-            st.error(f"Failed to build EPUB: {exc}")
-            with st.expander("Error details — EPUB build"):
-                st.code(traceback.format_exc())
+    _existing = _read_job_state(job_key)
+    if _existing and _existing.get("status") == "running" and time.time() - _existing.get("heartbeat", 0) < 300:
+        st.info("A translation for this book and model is already running — progress below.")
     else:
-        status.empty()
-        st.error("No chapters were translated — nothing to download.")
+        with open(_job_input_path(job_key), "wb") as f:
+            f.write(uploaded.getvalue())
+        _init_state = {
+            "status": "running", "message": "starting ...", "heartbeat": time.time(),
+            "selected": selected_indices, "total": len(selected_indices),
+            "translated": 0, "failed": [], "out_name": f"{name_root}_de.epub",
+        }
+        _write_job_state(job_key, _init_state)
+        threading.Thread(
+            target=_run_translation_job,
+            args=(job_key, _job_input_path(job_key), _job_output_path(job_key),
+                  selected_indices, provider_name, model, api_key, file_hash,
+                  _init_state),
+            daemon=True,
+        ).start()
 
-    progress_bar.progress(100)
+_job = _read_job_state(job_key)
+if _job and _job.get("status") == "running":
+    if time.time() - _job.get("heartbeat", 0) > 300:
+        st.error(
+            "The background translation stopped unexpectedly (no progress for "
+            "5 minutes) — press **Start translation** to run it again. Finished "
+            "chapters were cached and will not be paid for twice."
+        )
+    else:
+        st.info(
+            "Translating in the background — it is safe to switch tabs or close "
+            "this page. When you come back after it finishes, the EPUB downloads "
+            "automatically."
+        )
 
-    if epub_built:
-        status.empty()
-        if failed_chapters:
-            _failed_list = ", ".join(str(n) for n in failed_chapters)
-            st.warning(
-                f"Translation finished with errors: {len(all_translations)} chapter(s) translated, "
-                f"{len(failed_chapters)} failed (chapter(s) {_failed_list} left untranslated in the output)."
+        @st.fragment(run_every=2)
+        def _job_monitor():
+            j = _read_job_state(job_key)
+            if not j or j.get("status") != "running":
+                st.rerun(scope="app")
+            st.status(
+                f"{j.get('message', '...')} · chapter {min(j.get('translated', 0) + 1, j.get('total', 1))}/{j.get('total', '?')}",
+                state="running",
             )
-        else:
-            st.success(f"Translation finished: {len(all_translations)} chapter(s) translated.")
-        # Auto-trigger download so the file is saved before user switches away
-        _auto_download(out_bytes, default_out_name, "application/epub+zip")
+
+        _job_monitor()
+
+elif _job and _job.get("status") == "done":
+    _failed = _job.get("failed", [])
+    if _failed:
+        _failed_list = ", ".join(str(f["chapter"]) for f in _failed)
+        st.warning(
+            f"Translation finished with errors: {_job.get('translated', 0)} chapter(s) translated, "
+            f"{len(_failed)} failed (chapter(s) {_failed_list} left untranslated — see "
+            f"**Fix failed chapters** below)."
+        )
+    else:
+        st.success(f"Translation finished: {_job.get('translated', 0)} chapter(s) translated.")
+    try:
+        with open(_job_output_path(job_key), "rb") as f:
+            _out_bytes = f.read()
+        _out_name = _job.get("out_name") or f"{name_root}_de.epub"
+        if job_key not in st.session_state.auto_downloaded_jobs:
+            st.session_state.auto_downloaded_jobs.add(job_key)
+            _auto_download(_out_bytes, _out_name, "application/epub+zip")
         st.download_button(
             label="Download translated EPUB",
-            data=out_bytes,
-            file_name=default_out_name,
+            data=_out_bytes,
+            file_name=_out_name,
             mime="application/epub+zip",
             key="dl_epub_main",
         )
+    except FileNotFoundError:
+        st.error("The finished EPUB is no longer on the server — press **Start translation** to rebuild it (cached chapters are free).")
 
-    try:
-        os.remove(temp_input_path)
-    except Exception:
-        pass
+elif _job and _job.get("status") == "error":
+    st.error("Translation failed.")
+    with st.expander("Error details"):
+        st.code(_job.get("error", "unknown error"))
 
 # ========================
 # Fix failed chapters: inspect/edit cached raw LLM responses and retry for free
@@ -647,15 +634,3 @@ if _debuggable:
                 if _c2.button("🗑 Discard (re-translate via LLM)", key=f"del_{_key}"):
                     response_cache.delete(_key)
                     st.info("Discarded. This batch will be sent to the LLM again on the next run.")
-
-# --- Persistent EPUB download (visible on reruns within same session) ---
-if not start_button and not preview_button:
-    if st.session_state.output_epub_bytes is not None:
-        st.success("Previous translation available for download.")
-        st.download_button(
-            label="Download translated EPUB",
-            data=st.session_state.output_epub_bytes,
-            file_name=st.session_state.output_filename or "translated.epub",
-            mime="application/epub+zip",
-            key="dl_epub_persist",
-        )

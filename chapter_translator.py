@@ -6,9 +6,8 @@ from typing import List
 from bs4 import BeautifulSoup, NavigableString
 from ebooklib.epub import EpubHtml
 
+from llm_cache import estimate_tokens
 from llm_provider import LLMProvider
-
-SECTION_DELIMITER = "⟪§⟫"
 
 BLOCK_TAGS = ["p", "li", "h1", "h2", "h3", "h4", "blockquote"]
 
@@ -148,14 +147,11 @@ def parse_batch_response(response: str) -> dict:
 
 
 class ChapterTranslator:
-    def __init__(self, provider: LLMProvider, max_tokens: int = 100000, on_response=None,
-                 on_batch_progress=None, on_heal=None):
+    def __init__(self, provider: LLMProvider, max_tokens: int = 100000):
         self.provider = provider
         self.max_tokens = max_tokens
-        self._raw_responses: List[str] = []
-        self.on_response = on_response
-        self.on_batch_progress = on_batch_progress
-        self.on_heal = on_heal  # called with a short message when self-healing kicks in
+        self.on_batch_progress = None  # called with (batches_done, batches_total)
+        self.on_heal = None  # called with a short message when self-healing kicks in
 
     @staticmethod
     def extract_blocks(soup):
@@ -170,7 +166,6 @@ class ChapterTranslator:
 
     def translate(self, chapter: EpubHtml):
         """Translate chapter in-place. Returns (raw_sections, translated_sections)."""
-        self._raw_responses = []
         soup = BeautifulSoup(chapter.content, "html.parser")
         formatted_sections = self.extract_blocks(soup)
         raw_sections = [tag.get_text(strip=True) for tag in formatted_sections]
@@ -183,7 +178,6 @@ class ChapterTranslator:
 
     def translate_only(self, raw_sections: List[str]) -> List[str]:
         """Translate raw sections without applying to soup. Returns translated_sections."""
-        self._raw_responses = []
         return self._translate_chapter(raw_sections)
 
     def apply_cached(self, chapter: EpubHtml, raw_sections: List[str], translated_sections: List[str]):
@@ -245,6 +239,8 @@ class ChapterTranslator:
             return [""] * len(raw_sections)
 
         batches = self._make_batches(to_translate)
+        if self.on_batch_progress:
+            self.on_batch_progress(0, len(batches))
         translated = []
         for batch_idx, batch in enumerate(batches):
             translated.extend(self._translate_batch(batch))
@@ -325,7 +321,7 @@ class ChapterTranslator:
         current_length = 0
 
         for section in raw_sections:
-            section_tokens = len(section) // 3  # rough char-to-token estimate
+            section_tokens = estimate_tokens(section)
             if current_length + section_tokens > self.max_tokens and batches[-1]:
                 batches.append([])
                 current_length = 0
@@ -340,9 +336,5 @@ class ChapterTranslator:
             {"role": "user", "content": user_msg},
         ]
 
-        response = self.provider.chat(messages)
-        self._raw_responses.append(response)
-        if self.on_response:
-            self.on_response(response)
-        return response
+        return self.provider.chat(messages)
 

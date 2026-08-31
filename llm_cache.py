@@ -11,7 +11,7 @@ __all__ = ["LLMResponseCache", "CachedLLMProvider", "estimate_tokens", "format_t
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough char-to-token estimate (same heuristic as batching)."""
+    """Rough char-to-token estimate (also the batching heuristic)."""
     return len(text) // 3
 
 
