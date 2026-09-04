@@ -1,9 +1,10 @@
+import copy
 import hashlib
 import json
 import re
 from typing import List
 
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, Comment, NavigableString
 from ebooklib.epub import EpubHtml
 
 from llm_cache import estimate_tokens
@@ -11,9 +12,23 @@ from llm_provider import LLMProvider
 
 BLOCK_TAGS = ["p", "li", "h1", "h2", "h3", "h4", "blockquote"]
 
+# Inline emphasis that is carried through the translation. Everything else is
+# flattened to text: the LLM only ever sees these four tags, so a stray tag in
+# its answer is a signal that it invented markup and can be dropped safely.
+INLINE_TAGS = ["em", "i", "strong", "b"]
+
+# Flattening these ends a line in the rendered book, so their text must not be
+# glued to what precedes it. Tags outside this set (span, a, sup ...) sit inside
+# a line — separating those would invent a space in the middle of a word.
+LINE_BREAKING_TAGS = {
+    "p", "div", "br", "li", "ul", "ol", "dl", "dt", "dd", "blockquote", "pre",
+    "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "tr", "td", "th",
+    "section", "article", "figure", "figcaption",
+}
+
 # Bump when extraction/assembly changes shape (not just the prompt wording):
 # cached raw/translated lists from an older pipeline would misalign otherwise.
-PIPELINE_VERSION = "2"
+PIPELINE_VERSION = "3"
 
 SYSTEM_PROMPT = (
     "You translate books into simple German for adult learners at CEFR level "
@@ -82,6 +97,9 @@ USER_PROMPT_TEMPLATE = (
     "of input \"7\" and nothing else. Keep every key, even for very short "
     "sections.\n"
     "- Inside a value you may split a long sentence into shorter ones.\n"
+    "- Some values contain <em>, <i>, <strong> or <b> tags. Keep them in your "
+    "translation, around the German words that carry the same emphasis. Use the "
+    "same tag name, never add new tags, and never write any other HTML.\n"
     "- Check every sentence: longer than 20 words, more than one Nebensatz, or "
     "a word a B1 learner would not know? Rewrite it simpler.\n"
     "\n"
@@ -101,6 +119,8 @@ SINGLE_PROMPT_TEMPLATE = (
     "CONTEXT BEFORE and CONTEXT AFTER are the surrounding paragraphs of the "
     "same book chapter. Use them to resolve pronouns, speakers and recurring "
     "terms — but translate ONLY the TRANSLATE text.\n"
+    "If the text contains <em>, <i>, <strong> or <b> tags, keep them around the "
+    "German words that carry the same emphasis. Add no other HTML.\n"
     "Answer with ONLY the translation. No labels, no notes.\n"
     "\n"
     "CONTEXT BEFORE: {before}\n"
@@ -146,6 +166,52 @@ def parse_batch_response(response: str) -> dict:
     return salvaged
 
 
+def _inline_markup(node) -> str:
+    """Serialize a block's children, keeping only INLINE_TAGS as tags."""
+    parts = []
+    for child in node.children:
+        if isinstance(child, Comment):
+            continue
+        if isinstance(child, NavigableString):
+            parts.append(str(child))
+            continue
+        inner = _inline_markup(child)
+        # An emphasis tag wrapping no text (a spacer, an anchor) would reach the
+        # LLM as an empty pair of tags — keep whatever text it held instead.
+        if child.name in INLINE_TAGS and inner.strip():
+            parts.append(f"<{child.name}>{inner}</{child.name}>")
+        elif child.name in LINE_BREAKING_TAGS:
+            parts.append(f" {inner} ")
+        else:
+            parts.append(inner)
+    return "".join(parts)
+
+
+def section_text(tag) -> str:
+    """The translatable text of one block, with inline emphasis preserved.
+
+    Not `tag.get_text(strip=True)`: that strips every text node individually and
+    joins them with nothing, so 'he <em>said</em> that' collapses into
+    'hesaidthat'. Whitespace is instead collapsed once, over the whole block, so
+    the spaces that separate words survive and '<em>' stays where it belongs.
+    """
+    return re.sub(r"\s+", " ", _inline_markup(tag)).strip()
+
+
+def parse_inline(text: str) -> list:
+    """Nodes for a translated section: only INLINE_TAGS survive.
+
+    The text comes from an LLM, so anything else it may have written — a block
+    tag, a script, a half-open tag — is flattened to plain text rather than
+    injected into the book.
+    """
+    fragment = BeautifulSoup(text, "html.parser")
+    for element in fragment.find_all(True):
+        if element.name not in INLINE_TAGS:
+            element.unwrap()
+    return [child.extract() for child in list(fragment.contents)]
+
+
 class ChapterTranslator:
     def __init__(self, provider: LLMProvider, max_tokens: int = 100000):
         self.provider = provider
@@ -168,11 +234,11 @@ class ChapterTranslator:
         """Translate chapter in-place. Returns (raw_sections, translated_sections)."""
         soup = BeautifulSoup(chapter.content, "html.parser")
         formatted_sections = self.extract_blocks(soup)
-        raw_sections = [tag.get_text(strip=True) for tag in formatted_sections]
+        raw_sections = [section_text(tag) for tag in formatted_sections]
 
         translated_sections = self._translate_chapter(raw_sections)
 
-        self._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
+        self._apply_to_soup(formatted_sections, translated_sections, raw_sections)
         chapter.content = str(soup).encode("utf-8")
         return raw_sections, translated_sections
 
@@ -184,10 +250,10 @@ class ChapterTranslator:
         """Apply previously cached translations to a chapter without calling LLM."""
         soup = BeautifulSoup(chapter.content, "html.parser")
         formatted_sections = self.extract_blocks(soup)
-        self._apply_to_soup(soup, formatted_sections, translated_sections, raw_sections)
+        self._apply_to_soup(formatted_sections, translated_sections, raw_sections)
         chapter.content = str(soup).encode("utf-8")
 
-    def _apply_to_soup(self, soup, formatted_sections, translated_sections, raw_sections):
+    def _apply_to_soup(self, formatted_sections, translated_sections, raw_sections):
         for tag, new_text, original_text in zip(formatted_sections, translated_sections, raw_sections):
             # Blocks with no text (spacers, image-only paragraphs, pure anchors)
             # have nothing to translate: leave them untouched — clearing them
@@ -197,18 +263,37 @@ class ChapterTranslator:
             # For links only replace link name, preserve href
             if tag.name == "li" and tag.find("a"):
                 a_tag = tag.find("a")
-                a_tag.string = new_text
+                a_tag.clear()
+                for node in parse_inline(new_text):
+                    a_tag.append(node)
             else:
+                # Copied before the tag is cleared: the original keeps its own
+                # italics and inline markup instead of being flattened to text.
+                original_tag = self._original_copy(tag)
+
                 # Attributes (incl. the tag's own id) survive; descendant anchors
                 # are preserved by _set_translated_text so TOC fragments keep working
                 self._set_translated_text(tag, new_text)
 
-                original_tag = soup.new_tag(tag.name)
-                original_tag.append(NavigableString(f"[{original_text}]"))
                 if tag.parent:
                     tag.insert_after(original_tag)
                 else:
                     tag.append(original_tag)
+
+    @staticmethod
+    def _original_copy(tag):
+        """A verbatim copy of the block, wrapped in [ ].
+
+        ids are stripped: the translated tag keeps them, and a second element
+        carrying the same id would make TOC links land on the wrong one.
+        """
+        clone = copy.copy(tag)
+        clone.attrs.pop("id", None)
+        for descendant in clone.find_all(attrs={"id": True}):
+            del descendant["id"]
+        clone.insert(0, NavigableString("["))
+        clone.append(NavigableString("]"))
+        return clone
 
     @staticmethod
     def _set_translated_text(tag, new_text):
@@ -222,7 +307,8 @@ class ChapterTranslator:
         tag.clear()
         for anchor in anchors:
             tag.append(anchor)
-        tag.append(NavigableString(new_text))
+        for node in parse_inline(new_text):
+            tag.append(node)
 
     def _translate_chapter(self, raw_sections: List[str]) -> List[str]:
         """Translate entire chapter as flowing text, split back by delimiters."""

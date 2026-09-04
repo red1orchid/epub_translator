@@ -8,7 +8,7 @@ import unittest
 
 from bs4 import BeautifulSoup
 
-from chapter_translator import ChapterTranslator, parse_batch_response
+from chapter_translator import ChapterTranslator, parse_batch_response, section_text
 from llm_provider import LLMProvider
 
 
@@ -92,7 +92,7 @@ class TestExtractionFeedsCleanRequests(unittest.TestCase):
 
     def test_nested_blocks_are_not_extracted_twice(self):
         soup = BeautifulSoup(self.NESTED_HTML, "html.parser")
-        texts = [t.get_text(strip=True) for t in ChapterTranslator.extract_blocks(soup)]
+        texts = [section_text(t) for t in ChapterTranslator.extract_blocks(soup)]
         # each piece of text exactly once — no parent/child duplicates
         self.assertEqual(texts.count("Quoted text."), 1, texts)
         self.assertEqual(texts.count("List item text."), 1, texts)
@@ -102,7 +102,7 @@ class TestExtractionFeedsCleanRequests(unittest.TestCase):
 
     def test_request_payload_from_nested_html_has_no_duplicates(self):
         soup = BeautifulSoup(self.NESTED_HTML, "html.parser")
-        raw = [t.get_text(strip=True) for t in ChapterTranslator.extract_blocks(soup)]
+        raw = [section_text(t) for t in ChapterTranslator.extract_blocks(soup)]
         prov = RecordingProvider()
         make_translator(prov).translate_only(raw)
         (payload,) = prov.batch_payloads()
@@ -112,15 +112,87 @@ class TestExtractionFeedsCleanRequests(unittest.TestCase):
     def test_apply_after_extraction_renders_each_text_once(self):
         soup = BeautifulSoup(self.NESTED_HTML, "html.parser")
         tags = ChapterTranslator.extract_blocks(soup)
-        raw = [t.get_text(strip=True) for t in tags]
+        raw = [section_text(t) for t in tags]
         prov = RecordingProvider()
         tr = make_translator(prov)
         translated = tr.translate_only(raw)
-        tr._apply_to_soup(soup, tags, translated, raw)
+        tr._apply_to_soup(tags, translated, raw)
         html = str(soup)
         self.assertEqual(html.count("DE:Quoted text."), 1, html)
-        self.assertEqual(html.count("[Quoted text.]"), 1, html)
+        # once as the translation, once in the bracketed original beside it
+        self.assertEqual(html.count("Quoted text."), 2, html)
         self.assertNotIn("[]", html)
+
+
+class TestInlineFormatting(unittest.TestCase):
+    def test_words_are_not_glued_together_across_inline_tags(self):
+        soup = BeautifulSoup("<p>he <em>said</em> that</p>", "html.parser")
+        self.assertEqual(section_text(soup.p), "he <em>said</em> that")
+
+    def test_no_space_is_invented_where_there_was_none(self):
+        soup = BeautifulSoup("<p>Das <b>Haus</b>dach und <i>x</i>.</p>", "html.parser")
+        self.assertEqual(section_text(soup.p), "Das <b>Haus</b>dach und <i>x</i>.")
+
+    def test_whitespace_and_newlines_collapse(self):
+        soup = BeautifulSoup("<p>he\n  <em>said</em>\n\tthat  </p>", "html.parser")
+        self.assertEqual(section_text(soup.p), "he <em>said</em> that")
+
+    def test_nested_block_text_is_separated_not_glued(self):
+        soup = BeautifulSoup("<li>Outer item<ul><li>Inner item</li></ul></li>", "html.parser")
+        self.assertEqual(section_text(soup.li), "Outer item Inner item")
+
+    def test_non_inline_markup_is_flattened(self):
+        soup = BeautifulSoup('<p>a <span class="x">b</span> <a href="u">c</a></p>', "html.parser")
+        self.assertEqual(section_text(soup.p), "a b c")
+
+    def test_empty_emphasis_does_not_reach_the_llm(self):
+        soup = BeautifulSoup('<p>text <em><a id="t"></a></em></p>', "html.parser")
+        self.assertEqual(section_text(soup.p), "text")
+
+    def test_original_copy_keeps_italics_and_spacing(self):
+        soup = BeautifulSoup("<body><p>he <em>said</em> that</p></body>", "html.parser")
+        tags = ChapterTranslator.extract_blocks(soup)
+        raw = [section_text(t) for t in tags]
+        prov = RecordingProvider()
+        tr = make_translator(prov)
+        tr._apply_to_soup(tags, tr.translate_only(raw), raw)
+        html = str(soup)
+        self.assertIn("[he <em>said</em> that]", html)
+        self.assertNotIn("hesaidthat", html)
+
+    def test_translated_emphasis_is_applied_as_real_markup(self):
+        soup = BeautifulSoup("<body><p>he <em>said</em> that</p></body>", "html.parser")
+        tags = ChapterTranslator.extract_blocks(soup)
+        raw = [section_text(t) for t in tags]
+        # RecordingProvider echoes the input, so the translation carries the tag
+        make_translator(RecordingProvider())._apply_to_soup(
+            tags, [f"DE:{raw[0]}"], raw
+        )
+        self.assertIn("DE:he <em>said</em> that", str(soup))
+        self.assertNotIn("&lt;em&gt;", str(soup))
+
+    def test_invented_markup_in_a_translation_is_flattened(self):
+        soup = BeautifulSoup("<body><p>x</p></body>", "html.parser")
+        tags = ChapterTranslator.extract_blocks(soup)
+        make_translator(RecordingProvider())._apply_to_soup(
+            tags, ['<div>a</div><script>bad()</script><em>b</em>'], ["x"]
+        )
+        html = str(soup)
+        self.assertNotIn("<script", html)
+        self.assertNotIn("<div", html)
+        self.assertIn("<em>b</em>", html)
+
+    def test_ids_are_not_duplicated_by_the_original_copy(self):
+        soup = BeautifulSoup(
+            '<body><p id="p1">a <a id="anchor"></a>b</p></body>', "html.parser"
+        )
+        tags = ChapterTranslator.extract_blocks(soup)
+        raw = [section_text(t) for t in tags]
+        tr = make_translator(RecordingProvider())
+        tr._apply_to_soup(tags, tr.translate_only(raw), raw)
+        html = str(soup)
+        self.assertEqual(html.count('id="p1"'), 1, html)
+        self.assertEqual(html.count('id="anchor"'), 1, html)
 
 
 class TestParseBatchResponse(unittest.TestCase):

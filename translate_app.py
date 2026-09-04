@@ -1,7 +1,6 @@
 import os
 import re
 import tempfile
-import base64
 import hashlib
 import json
 import threading
@@ -14,7 +13,7 @@ from ebooklib import epub
 import ebooklib
 from bs4 import BeautifulSoup
 
-from chapter_translator import ChapterTranslator, PROMPT_VERSION, parse_batch_response
+from chapter_translator import ChapterTranslator, PROMPT_VERSION, parse_batch_response, section_text
 from llm_cache import CachedLLMProvider, LLMResponseCache, estimate_tokens, format_tokens
 from llm_provider import create_provider
 from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_options
@@ -22,7 +21,7 @@ from model_catalog import FALLBACK_PRICES_DATE, fetch_live_prices, get_model_opt
 st.set_page_config(page_title="EPUB Chapter Translator", layout="centered")
 
 # --- Version (update with each commit to verify deployment) ---
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 
 # --- Session state ---
 if "auto_downloaded_jobs" not in st.session_state:
@@ -175,6 +174,15 @@ def _translatable_chapters(book):
 # through files in CACHE_DIR, so it survives the browser tab being suspended
 # (mobile), page reloads, and even full session loss. One job per book+model.
 
+def _translated_name(name_root):
+    """Name the finished book is downloaded under.
+
+    It must differ from the uploaded file: a download that keeps the original
+    name lands on top of the source book in the user's download folder.
+    """
+    return f"{name_root}_de.epub"
+
+
 def _job_key(file_hash, prov, mdl):
     return hashlib.sha256(f"job:{file_hash}:{prov}:{mdl}:{PROMPT_VERSION}".encode()).hexdigest()[:16]
 
@@ -286,24 +294,40 @@ def _run_translation_job(job_key, input_path, output_path, selected_indices,
     flush()
 
 
-def _auto_download(data: bytes, filename: str, mime: str):
-    """Best-effort automatic download via JS."""
-    if len(data) > 50 * 1024 * 1024:  # skip for files > 50 MB
-        return
-    b64 = base64.b64encode(data).decode()
+def _auto_download(label):
+    """Click the page's own download button once, in the top-level document.
+
+    The file name has to come from Streamlit's Content-Disposition header. A
+    blob built in here would belong to this sandboxed component iframe, and
+    browsers ignore `download` on a cross-origin blob — they then name the file
+    themselves, which is how a translation could come down under the original
+    book's name and overwrite it. The button may not be rendered yet when this
+    script first runs, so poll briefly for it.
+    """
     components.html(
-        f'<script>'
-        f'try{{'
-        f'var r=atob("{b64}");var a=new Uint8Array(r.length);'
-        f'for(var i=0;i<r.length;i++)a[i]=r.charCodeAt(i);'
-        f'var b=new Blob([a],{{type:"{mime}"}});var u=URL.createObjectURL(b);'
-        f'var l=document.createElement("a");l.href=u;l.download="{filename}";'
-        f'document.body.appendChild(l);l.click();'
-        f'setTimeout(function(){{URL.revokeObjectURL(u)}},5000);'
-        f'}}catch(e){{console.log("auto-dl failed",e)}}'
-        f'</script>',
+        """<script>
+(function () {
+  var doc;
+  try { doc = window.parent.document; } catch (e) { return; }
+  var label = %s;
+  var tries = 0;
+  var timer = setInterval(function () {
+    var groups = doc.querySelectorAll('[data-testid="stDownloadButton"]');
+    for (var i = 0; i < groups.length; i++) {
+      if (groups[i].innerText.indexOf(label) !== -1) {
+        var el = groups[i].querySelector('a, button');
+        if (el) { clearInterval(timer); el.click(); return; }
+      }
+    }
+    if (++tries > 40) { clearInterval(timer); }
+  }, 100);
+})();
+</script>""" % json.dumps(label),
         height=0,
     )
+
+
+DOWNLOAD_LABEL = "Download translated EPUB"
 
 
 st.title("EPUB Chapter Translator")
@@ -459,7 +483,7 @@ if preview_button:
 
     soup = BeautifulSoup(preview_chapter.get_content(), "html.parser")
     blocks = ChapterTranslator.extract_blocks(soup)
-    raw_sections = [tag.get_text(strip=True) for tag in blocks if tag.get_text(strip=True)]
+    raw_sections = [s for s in (section_text(tag) for tag in blocks) if s]
     preview_sections = raw_sections[:PREVIEW_SECTIONS]
 
     if not preview_sections:
@@ -478,8 +502,10 @@ if preview_button:
         with st.spinner("Calling LLM ..."):
             translated = translator._translate_batch(preview_sections)
         for orig, trans in zip(preview_sections, translated):
-            st.markdown(f"**→** {trans}")
-            st.caption(orig)
+            # Sections carry inline <em>/<strong> markup; show it as plain text
+            # rather than as escaped tags in the middle of a sentence.
+            st.markdown(f"**→** {BeautifulSoup(trans, 'html.parser').get_text()}")
+            st.caption(BeautifulSoup(orig, "html.parser").get_text())
     except Exception as exc:
         st.error(f"Error: {exc}")
         with st.expander("Error details"):
@@ -507,7 +533,7 @@ if start_button:
         _init_state = {
             "status": "running", "message": "starting ...", "heartbeat": time.time(),
             "selected": selected_indices, "total": len(selected_indices),
-            "translated": 0, "failed": [], "out_name": f"{name_root}_de.epub",
+            "translated": 0, "failed": [], "out_name": _translated_name(name_root),
         }
         _write_job_state(job_key, _init_state)
         threading.Thread(
@@ -559,17 +585,22 @@ elif _job and _job.get("status") == "done":
     try:
         with open(_job_output_path(job_key), "rb") as f:
             _out_bytes = f.read()
-        _out_name = _job.get("out_name") or f"{name_root}_de.epub"
-        if job_key not in st.session_state.auto_downloaded_jobs:
-            st.session_state.auto_downloaded_jobs.add(job_key)
-            _auto_download(_out_bytes, _out_name, "application/epub+zip")
+        _out_name = _job.get("out_name") or ""
+        # A job state written by an older version could still carry the
+        # uploaded name; downloading under it would overwrite the original.
+        if not _out_name.endswith("_de.epub"):
+            _out_name = _translated_name(name_root)
         st.download_button(
-            label="Download translated EPUB",
+            label=DOWNLOAD_LABEL,
             data=_out_bytes,
             file_name=_out_name,
             mime="application/epub+zip",
             key="dl_epub_main",
         )
+        st.caption(f"Downloads as `{_out_name}`")
+        if job_key not in st.session_state.auto_downloaded_jobs:
+            st.session_state.auto_downloaded_jobs.add(job_key)
+            _auto_download(DOWNLOAD_LABEL)
     except FileNotFoundError:
         st.error("The finished EPUB is no longer on the server — press **Start translation** to rebuild it (cached chapters are free).")
 
